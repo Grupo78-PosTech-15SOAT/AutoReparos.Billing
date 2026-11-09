@@ -1,7 +1,14 @@
+using AutoReparos.Billing.Api;
 using AutoReparos.Billing.Application;
 using AutoReparos.Billing.Domain;
 using AutoReparos.Billing.Infrastructure;
 using Amazon;
+using OpenTelemetry;
+using OpenTelemetry.Logs;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
+using System.Diagnostics;
 using Amazon.Runtime;
 using Amazon.SQS;
 using Amazon.SQS.Model;
@@ -234,6 +241,26 @@ public sealed class BillingLifecycleTests
         Assert.Equal(5, sqs.MainAttempts); Assert.Equal(1, sqs.DeadLetterAttempts); Assert.Equal(1, alerts.Count);
     }
 
+    [Fact]
+    public async Task TelemetryExports()
+    {
+        var resource = TelemetriaBilling.Configurar(ResourceBuilder.CreateEmpty(), "billing-test", "Testing").Build();
+        Assert.Equal("billing-test", resource.Attributes.Single(a => a.Key == "service.name").Value);
+        Assert.Equal("Testing", resource.Attributes.Single(a => a.Key == "deployment.environment.name").Value);
+
+        var capture = new TelemetryCapture();
+        using var factory = new BillingApiFactory(new Store(), new Provider(), new Publisher(), new Alerts(), new Readiness(true), capture);
+        using var client = factory.CreateClient();
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.PostAsync("/api/v1/orcamentos", null)).StatusCode);
+        factory.Services.GetRequiredService<ILogger<BillingLifecycleTests>>().LogInformation("telemetry probe");
+        factory.Services.GetRequiredService<TracerProvider>().ForceFlush();
+        factory.Services.GetRequiredService<MeterProvider>().ForceFlush();
+        factory.Services.GetRequiredService<OpenTelemetry.Logs.LoggerProvider>().ForceFlush();
+        Assert.Contains(capture.Spans, s => s.Kind == ActivityKind.Server);
+        Assert.Contains(capture.Metrics, m => m.Name == "http.server.request.duration");
+        Assert.Contains(capture.Logs, l => l.FormattedMessage == "telemetry probe");
+    }
+
     private sealed class RecordingSqs() : AmazonSQSClient(new AnonymousAWSCredentials(), new AmazonSQSConfig { RegionEndpoint = RegionEndpoint.USEast1 })
     {
         public int MainAttempts { get; private set; }
@@ -245,14 +272,32 @@ public sealed class BillingLifecycleTests
         }
     }
 
-    private sealed class BillingApiFactory(Store store, Provider provider, Publisher publisher, Alerts alerts, Readiness readiness) : WebApplicationFactory<Program>
+    private sealed class TelemetryCapture
+    {
+        public List<Activity> Spans { get; } = [];
+        public List<OpenTelemetry.Metrics.Metric> Metrics { get; } = [];
+        public List<LogRecord> Logs { get; } = [];
+    }
+
+    private sealed class BillingApiFactory(Store store, Provider provider, Publisher publisher, Alerts alerts, Readiness readiness, TelemetryCapture? telemetry = null) : WebApplicationFactory<Program>
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.UseEnvironment("Testing");
-            builder.ConfigureAppConfiguration((_, config) => config.AddInMemoryCollection(new Dictionary<string, string?> { ["MercadoPago:WebhookSecret"] = "webhook-test-secret" }));
+            builder.ConfigureAppConfiguration((_, config) => config.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["MercadoPago:WebhookSecret"] = "webhook-test-secret",
+                ["Telemetry:OtlpEndpoint"] = "http://127.0.0.1:1",
+            }));
             builder.ConfigureServices(services =>
             {
+                if (telemetry is not null)
+                {
+                    services.AddOpenTelemetry()
+                        .WithTracing(tracing => tracing.AddInMemoryExporter(telemetry.Spans))
+                        .WithMetrics(metrics => metrics.AddInMemoryExporter(telemetry.Metrics));
+                    services.Configure<OpenTelemetryLoggerOptions>(options => options.AddInMemoryExporter(telemetry.Logs));
+                }
                 services.RemoveAll<IBillingStore>(); services.AddSingleton<IBillingStore>(store);
                 services.RemoveAll<ICheckoutProvider>(); services.AddSingleton<ICheckoutProvider>(provider);
                 services.RemoveAll<IResultadoPublisher>(); services.AddSingleton<IResultadoPublisher>(publisher);
