@@ -1,6 +1,7 @@
 using Amazon.SQS;
 using AutoReparos.Billing.Api;
 using AutoReparos.Billing.Application;
+using AutoReparos.Billing.Domain;
 using AutoReparos.Billing.Infrastructure;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
@@ -66,6 +67,8 @@ app.Use(async (context, next) =>
     try { await next(); }
     catch (DependenciaIndisponivelException ex) when (!context.Response.HasStarted)
     { context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable; await context.Response.WriteAsJsonAsync(new { codigo = "dependencia_indisponivel", dependencia = ex.Dependencia }); }
+    catch (RespostaProvedorInvalidaException ex) when (!context.Response.HasStarted)
+    { context.Response.StatusCode = StatusCodes.Status502BadGateway; await context.Response.WriteAsJsonAsync(new { codigo = "resposta_provedor_invalida", provedor = ex.Provedor }); }
     catch (ConcorrenciaException) when (!context.Response.HasStarted)
     { context.Response.StatusCode = StatusCodes.Status409Conflict; await context.Response.WriteAsJsonAsync(new { codigo = "conflito_concorrencia" }); }
 });
@@ -74,7 +77,7 @@ app.UseAuthentication(); app.UseAuthorization();
 var orcamentos = app.MapGroup("/api/v1/orcamentos").RequireAuthorization("OperarBilling");
 orcamentos.MapPost("", async (CriarOrcamento request, BillingService service, CancellationToken ct) =>
 {
-    if (request.OrdemServicoId == Guid.Empty || request.ClienteId == Guid.Empty || request.Valor <= 0 || decimal.Round(request.Valor, 2) != request.Valor)
+    if (request.OrdemServicoId == Guid.Empty || request.ClienteId == Guid.Empty || request.Valor <= 0 || request.Valor > LimitesBilling.ValorMaximo || decimal.Round(request.Valor, 2) != request.Valor)
         return Results.UnprocessableEntity(new { codigo = "orcamento_invalido" });
     var result = await service.CriarOrcamentoAsync(request, ct);
     return Results.Created($"/api/v1/orcamentos/{result.Id}", new { result.Id, result.OrdemServicoId, result.ClienteId, result.Valor, status = result.Status.ToString(), approvalUrl = $"/api/v1/orcamentos/{result.Id}/aprovacao" });
@@ -102,9 +105,11 @@ pagamentos.MapPost("/{id:guid}/checkout", async (Guid id, HttpContext context, B
 pagamentos.MapPost("/{id:guid}/reembolsos", async (Guid id, SolicitacaoReembolso request, HttpContext context, BillingService service, CancellationToken ct) =>
 {
     var aprovador = context.User.FindFirst("sub")?.Value ?? context.User.Identity?.Name ?? "";
-    if (request.Valor <= 0 || decimal.Round(request.Valor, 2) != request.Valor || string.IsNullOrWhiteSpace(request.Referencia) || string.IsNullOrWhiteSpace(aprovador)) return Results.UnprocessableEntity(new { codigo = "reembolso_invalido" });
+    if (request.Valor <= 0 || request.Valor > LimitesBilling.ValorMaximo || decimal.Round(request.Valor, 2) != request.Valor || string.IsNullOrWhiteSpace(request.Referencia) || string.IsNullOrWhiteSpace(aprovador)) return Results.UnprocessableEntity(new { codigo = "reembolso_invalido" });
     try { var r = await service.ReembolsarAsync(id, request.Valor, aprovador, request.Referencia, ct); return Results.Created($"/api/v1/pagamentos/{id}/reembolsos/{r.Id}", new { r.Id, r.PagamentoId, r.Valor, r.Aprovador, r.Referencia }); }
     catch (KeyNotFoundException) { return Results.NotFound(); }
+    catch (ArgumentException) { return Results.UnprocessableEntity(new { codigo = "reembolso_invalido" }); }
+    catch (HttpRequestException) { return Results.Json(new { codigo = "reembolso_recusado_provedor" }, statusCode: StatusCodes.Status502BadGateway); }
     catch (InvalidOperationException ex) { return Results.Conflict(new { codigo = "reembolso_indisponivel", detalhe = ex.Message }); }
 }).RequireAuthorization("AprovarReembolso");
 

@@ -5,7 +5,7 @@ public sealed class Orcamento
     private Orcamento() { }
     public Orcamento(Guid ordemServicoId, Guid clienteId, decimal valor, DateTimeOffset criadoEm)
     {
-        if (ordemServicoId == Guid.Empty || clienteId == Guid.Empty || valor <= 0 || decimal.Round(valor, 2) != valor)
+        if (ordemServicoId == Guid.Empty || clienteId == Guid.Empty || valor <= 0 || valor > LimitesBilling.ValorMaximo || decimal.Round(valor, 2) != valor)
             throw new ArgumentException("Orçamento inválido.");
         Id = Guid.NewGuid(); OrdemServicoId = ordemServicoId; ClienteId = clienteId; Valor = valor; CriadoEm = criadoEm;
         Status = StatusOrcamento.Pendente;

@@ -9,6 +9,10 @@ public sealed record SolicitacaoReembolso(decimal Valor, string Referencia);
 
 public sealed class ConcorrenciaException(string mensagem, Exception? inner = null) : Exception(mensagem, inner);
 public sealed class PublicacaoResultadoException(string mensagem, Exception? inner = null) : InvalidOperationException(mensagem, inner);
+public sealed class RespostaProvedorInvalidaException(string provedor, string detalhe, Exception? inner = null) : Exception($"Resposta inválida de {provedor}: {detalhe}", inner)
+{
+    public string Provedor { get; } = provedor;
+}
 public sealed class DependenciaIndisponivelException(string dependencia, Exception? inner = null) : Exception($"Dependência indisponível: {dependencia}.", inner)
 {
     public string Dependencia { get; } = dependencia;
@@ -76,10 +80,25 @@ public sealed class BillingService(IBillingStore store, ICheckoutProvider provid
     {
         var pagamento = await store.ObterPagamentoAsync(pagamentoId, ct) ?? throw new KeyNotFoundException();
         var providerReference = pagamento.ReferenciaProvedor ?? throw new InvalidOperationException("Referência de provedor ausente.");
-        var reembolso = pagamento.Reembolsar(valor, aprovador, referencia, DateTimeOffset.UtcNow);
+        var existente = pagamento.ObterReembolso(referencia);
+        Reembolso reembolso;
+        if (existente is null)
+        {
+            // Passo 1: reserva Pendente, ja conta no limite cumulativo e nao muda o status do pagamento.
+            reembolso = pagamento.Reembolsar(valor, aprovador, referencia, DateTimeOffset.UtcNow);
+            await store.SalvarAsync(ct);
+        }
+        else if (existente.Estado == EstadoReembolso.Pendente && existente.Valor == valor)
+            reembolso = existente; // retomada: mesma referencia, mesma chave de idempotencia
+        else throw new InvalidOperationException("Reembolso inválido.");
         var key = "refund-" + Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes($"{pagamentoId:N}:{referencia}")));
-        await store.SalvarAsync(ct);
         try { await provider.ReembolsarAsync(providerReference, valor, key, ct); }
+        catch (Exception ex) when (!FalhaDefinitiva(ex))
+        {
+            // Desfecho incerto: o provedor pode ter processado. Mantem a reserva Pendente e propaga.
+            await alerts.AlertarAsync("billing.refund_outcome_unknown", $"{pagamentoId}/{referencia}: {ex.GetType().Name}", CancellationToken.None);
+            throw;
+        }
         catch
         {
             pagamento.DesfazerReembolso(reembolso);
@@ -87,6 +106,11 @@ public sealed class BillingService(IBillingStore store, ICheckoutProvider provid
             catch (Exception ex) { await alerts.AlertarAsync("billing.refund_compensation_failed", $"{pagamentoId}: {ex.Message}", CancellationToken.None); }
             throw;
         }
+        pagamento.ConfirmarReembolso(reembolso);
+        await store.SalvarAsync(CancellationToken.None);
         return reembolso;
     }
+    private static bool FalhaDefinitiva(Exception ex) =>
+        ex is HttpRequestException { StatusCode: { } status } && (int)status is >= 400 and < 500 &&
+        status is not (System.Net.HttpStatusCode.RequestTimeout or System.Net.HttpStatusCode.TooManyRequests);
 }

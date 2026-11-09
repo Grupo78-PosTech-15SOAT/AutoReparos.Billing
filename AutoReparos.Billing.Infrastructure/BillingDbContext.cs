@@ -25,6 +25,7 @@ public sealed class BillingDbContext(DbContextOptions<BillingDbContext> options)
         model.Entity<Reembolso>().ToTable("reembolsos").HasKey(x => x.Id);
         model.Entity<Reembolso>().Property(x => x.Id).ValueGeneratedNever();
         model.Entity<Reembolso>().Property(x => x.Valor).HasPrecision(18, 2);
+        model.Entity<Reembolso>().Property(x => x.Estado).HasConversion<int>();
         model.Entity<Reembolso>().HasIndex(x => new { x.PagamentoId, x.Referencia }).IsUnique();
     }
     public Task<Orcamento?> ObterOrcamentoAsync(Guid id, CancellationToken ct) => Orcamentos.Include(x => x.Pagamento).ThenInclude(x => x!.Reembolsos).SingleOrDefaultAsync(x => x.Id == id, ct);

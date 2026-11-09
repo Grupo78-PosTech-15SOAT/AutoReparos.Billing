@@ -24,8 +24,8 @@ public sealed class MercadoPagoClient(HttpClient http, IConfiguration config, IA
         return request;
     }, async (response, token) =>
     {
-        using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
-        return new AbrirCheckout(body.RootElement.GetProperty("init_point").GetString()!, body.RootElement.GetProperty("id").GetString()!);
+        using var body = ParseBody(await response.Content.ReadAsStringAsync(token));
+        return new AbrirCheckout(Required(body.RootElement, "init_point"), Required(body.RootElement, "id"));
     }, ct);
 
     public Task<string> ReembolsarAsync(string referencia, decimal valor, string idempotencyKey, CancellationToken ct) => RequestWithRetryAsync(
@@ -38,7 +38,7 @@ public sealed class MercadoPagoClient(HttpClient http, IConfiguration config, IA
         return request;
     }, async (response, token) =>
     {
-        using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token)); return body.RootElement.GetProperty("id").ToString();
+        using var body = ParseBody(await response.Content.ReadAsStringAsync(token)); return Required(body.RootElement, "id");
     }, ct);
 
     public Task<(Guid PagamentoId, AutoReparos.Billing.Domain.StatusPagamento Status, string Referencia)?> ConsultarPagamentoAsync(string id, CancellationToken ct) => RequestWithRetryAsync<(Guid, AutoReparos.Billing.Domain.StatusPagamento, string)?>(
@@ -49,10 +49,11 @@ public sealed class MercadoPagoClient(HttpClient http, IConfiguration config, IA
         return request;
     }, async (response, token) =>
     {
-        using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
+        using var body = ParseBody(await response.Content.ReadAsStringAsync(token));
         var root = body.RootElement;
-        if (!Guid.TryParse(root.GetProperty("external_reference").GetString(), out var paymentId)) return null;
-        var status = root.GetProperty("status").GetString() switch
+        if (root.ValueKind != JsonValueKind.Object) throw new RespostaProvedorInvalidaException("mercado-pago", "corpo inesperado.");
+        if (!root.TryGetProperty("external_reference", out var reference) || reference.ValueKind != JsonValueKind.String || !Guid.TryParse(reference.GetString(), out var paymentId)) return null;
+        var status = Required(root, "status") switch
         {
             "approved" => AutoReparos.Billing.Domain.StatusPagamento.Capturado,
             "rejected" => AutoReparos.Billing.Domain.StatusPagamento.Rejeitado,
@@ -63,6 +64,19 @@ public sealed class MercadoPagoClient(HttpClient http, IConfiguration config, IA
         };
         return status is null ? null : (paymentId, status.Value, id);
     }, ct);
+
+    internal static JsonDocument ParseBody(string content)
+    {
+        try { return JsonDocument.Parse(content); }
+        catch (JsonException ex) { throw new RespostaProvedorInvalidaException("mercado-pago", "corpo não é JSON.", ex); }
+    }
+
+    internal static string Required(JsonElement root, string name)
+    {
+        if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty(name, out var value) &&
+            value.ValueKind is JsonValueKind.String or JsonValueKind.Number && value.ToString() is { Length: > 0 } text) return text;
+        throw new RespostaProvedorInvalidaException("mercado-pago", $"campo '{name}' ausente ou inválido.");
+    }
 
     private Task<T> RequestWithRetryAsync<T>(string alertCode, Func<HttpRequestMessage> requestFactory,
         Func<HttpResponseMessage, CancellationToken, Task<T>> read, CancellationToken ct) =>
@@ -83,10 +97,16 @@ public static class DependencyHttp
         {
             await DependencyRetry.ExecuteAsync(async token =>
             {
-                using var request = requestFactory(); using var response = await http.SendAsync(request, token);
-                if (!response.IsSuccessStatusCode)
-                    throw new HttpRequestException($"{dependencia} respondeu {(int)response.StatusCode}.", null, response.StatusCode);
-                result = await read(response, token);
+                try
+                {
+                    using var request = requestFactory(); using var response = await http.SendAsync(request, token);
+                    if (!response.IsSuccessStatusCode)
+                        throw new HttpRequestException($"{dependencia} respondeu {(int)response.StatusCode}.", null, response.StatusCode);
+                    result = await read(response, token);
+                }
+                // Timeout do HttpClient: cancelamento que nao veio do chamador conta como falha transitoria.
+                catch (OperationCanceledException ex) when (!token.IsCancellationRequested)
+                { throw new HttpRequestException($"{dependencia} excedeu o tempo limite.", ex); }
             }, token => alerts.AlertarAsync(alertCode, "Tentativas de integração esgotadas.", token), ct, delay: delay, transient: IsTransient);
         }
         catch (Exception ex) when (ex is not OperationCanceledException && IsTransient(ex))
@@ -188,8 +208,8 @@ public sealed class OsReadinessClient(HttpClient http, IConfiguration config, IA
             return request;
         }, async (response, token) =>
         {
-            using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
-            return string.Equals(body.RootElement.GetProperty("status").GetString(), "Concluida", StringComparison.OrdinalIgnoreCase);
+            using var body = MercadoPagoClient.ParseBody(await response.Content.ReadAsStringAsync(token));
+            return string.Equals(MercadoPagoClient.Required(body.RootElement, "status"), "Concluida", StringComparison.OrdinalIgnoreCase);
         }, ct, delay);
     }
 }

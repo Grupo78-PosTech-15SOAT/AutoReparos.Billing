@@ -38,19 +38,26 @@ public sealed class Pagamento
     public void MarcarResultadoPublicado() { ResultadoPublicado = true; Revisao++; }
     public void DesfazerReembolso(Reembolso reembolso)
     {
-        if (!_reembolsos.Remove(reembolso)) return;
-        if (Status == StatusPagamento.Reembolsado) Status = StatusPagamento.Capturado;
+        if (reembolso.Estado != EstadoReembolso.Pendente || !_reembolsos.Remove(reembolso)) return;
         Revisao++;
     }
+    public void ConfirmarReembolso(Reembolso reembolso)
+    {
+        reembolso.Confirmar(); Revisao++;
+        if (Status == StatusPagamento.Capturado && _reembolsos.Where(r => r.Estado == EstadoReembolso.Confirmado).Sum(r => r.Valor) == Valor) Status = StatusPagamento.Reembolsado;
+    }
+    public Reembolso? ObterReembolso(string referencia) => _reembolsos.FirstOrDefault(r => r.Referencia == referencia);
     public Reembolso Reembolsar(decimal valor, string aprovador, string referencia, DateTimeOffset quando)
     {
+        if (Status != StatusPagamento.Capturado || valor <= 0 || decimal.Round(valor, 2) != valor ||
+            string.IsNullOrWhiteSpace(aprovador) || string.IsNullOrWhiteSpace(referencia))
+            throw new InvalidOperationException("Reembolso inválido.");
+        if (valor > Valor) throw new ArgumentOutOfRangeException(nameof(valor), "Valor do reembolso excede o valor do pagamento.");
         var jaReembolsado = _reembolsos.Sum(r => r.Valor);
-        if (Status != StatusPagamento.Capturado || valor <= 0 || decimal.Round(valor, 2) != valor || valor + jaReembolsado > Valor ||
-            string.IsNullOrWhiteSpace(aprovador) || string.IsNullOrWhiteSpace(referencia) || _reembolsos.Any(r => r.Referencia == referencia))
+        if (valor + jaReembolsado > Valor || _reembolsos.Any(r => r.Referencia == referencia))
             throw new InvalidOperationException("Reembolso inválido.");
         var reembolso = new Reembolso(Id, valor, aprovador, referencia, quando); _reembolsos.Add(reembolso);
         Revisao++;
-        if (valor + jaReembolsado == Valor) Status = StatusPagamento.Reembolsado;
         return reembolso;
     }
 }
