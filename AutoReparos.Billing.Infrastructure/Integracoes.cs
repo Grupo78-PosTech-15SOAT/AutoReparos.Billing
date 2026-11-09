@@ -14,12 +14,12 @@ namespace AutoReparos.Billing.Infrastructure;
 public sealed class MercadoPagoClient(HttpClient http, IConfiguration config, IAlertSink alerts, Func<int, TimeSpan>? delay = null) : ICheckoutProvider
 {
     private string Token => config["MercadoPago:AccessToken"] ?? throw new InvalidOperationException("Mercado Pago não configurado.");
-    public Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, CancellationToken ct) => RequestWithRetryAsync(
+    public Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, string idempotencyKey, CancellationToken ct) => RequestWithRetryAsync(
         "billing.mercadopago.checkout_failed", () =>
     {
         var request = new HttpRequestMessage(HttpMethod.Post, "https://api.mercadopago.com/checkout/preferences");
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", Token);
-        request.Headers.Add("X-Idempotency-Key", pagamentoId.ToString("N"));
+        request.Headers.Add("X-Idempotency-Key", idempotencyKey);
         request.Content = JsonContent.Create(new { external_reference = pagamentoId.ToString(), items = new[] { new { id = pagamentoId.ToString(), title = "Serviço automotivo", quantity = 1, currency_id = "BRL", unit_price = valor } } });
         return request;
     }, async (response, token) =>

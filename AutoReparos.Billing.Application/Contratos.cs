@@ -27,7 +27,7 @@ public interface IBillingStore
     Task AdicionarOrcamentoAsync(Orcamento orcamento, CancellationToken ct);
     Task SalvarAsync(CancellationToken ct);
 }
-public interface ICheckoutProvider { Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, CancellationToken ct); Task<string> ReembolsarAsync(string referencia, decimal valor, string idempotencyKey, CancellationToken ct); Task<(Guid PagamentoId, StatusPagamento Status, string Referencia)?> ConsultarPagamentoAsync(string id, CancellationToken ct); }
+public interface ICheckoutProvider { Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, string idempotencyKey, CancellationToken ct); Task<string> ReembolsarAsync(string referencia, decimal valor, string idempotencyKey, CancellationToken ct); Task<(Guid PagamentoId, StatusPagamento Status, string Referencia)?> ConsultarPagamentoAsync(string id, CancellationToken ct); }
 public interface IResultadoPublisher { Task PublicarAsync(EventoPagamento evento, CancellationToken ct); }
 public interface IWebhookSignatureValidator { bool IsValid(string? signature, string? requestId, string dataId); }
 public interface IAlertSink { Task AlertarAsync(string codigo, string detalhe, CancellationToken ct); }
@@ -57,7 +57,7 @@ public sealed class BillingService(IBillingStore store, ICheckoutProvider provid
         if (pagamento.Status == StatusPagamento.Capturado) throw new InvalidOperationException("Pagamento já capturado.");
         if (orcamento.Status != StatusOrcamento.Aprovado || !await readiness.ServicoConcluidoAsync(orcamento.OrdemServicoId, ct))
             throw new InvalidOperationException("Cobrança exige orçamento aprovado e serviço concluído.");
-        var checkout = await provider.CriarCheckoutAsync(pagamento.Id, pagamento.Valor, ct);
+        var checkout = await provider.CriarCheckoutAsync(pagamento.Id, pagamento.Valor, pagamento.ChaveIdempotenciaCheckout, ct);
         pagamento.IniciarCheckout(checkout.Url, checkout.Referencia); await store.SalvarAsync(ct); return pagamento;
     }
     public async Task AplicarWebhookAsync(Guid pagamentoId, StatusPagamento status, string referencia, CancellationToken ct)

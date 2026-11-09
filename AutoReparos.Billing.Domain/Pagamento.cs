@@ -13,12 +13,14 @@ public sealed class Pagamento
     public string? ReferenciaProvedor { get; private set; }
     public bool ResultadoPublicado { get; private set; }
     public int Revisao { get; private set; }
+    public int Tentativas { get; private set; }
+    public string ChaveIdempotenciaCheckout => $"checkout-{Id:N}-{Tentativas + 1}";
     public ICollection<Reembolso> Reembolsos => _reembolsos;
     public void IniciarCheckout(string url, string referencia)
     {
         if (Status is StatusPagamento.Pendente or StatusPagamento.Capturado or StatusPagamento.Reembolsado) throw new InvalidOperationException("Já existe tentativa ativa, pagamento capturado ou reembolsado.");
         if (string.IsNullOrWhiteSpace(url) || string.IsNullOrWhiteSpace(referencia)) throw new ArgumentException("Checkout e referência do provedor são obrigatórios.");
-        UrlCheckout = url; ReferenciaProvedor = referencia; Status = StatusPagamento.Pendente; Revisao++;
+        UrlCheckout = url; ReferenciaProvedor = referencia; Status = StatusPagamento.Pendente; Tentativas++; Revisao++;
     }
     public bool AplicarEstado(StatusPagamento status, string referencia)
     {
