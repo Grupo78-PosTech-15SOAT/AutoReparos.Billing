@@ -222,8 +222,213 @@ public sealed partial class BillingLifecycleTests
     private sealed class FailingRefundProvider : ICheckoutProvider
     {
         public Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, CancellationToken ct) => throw new NotSupportedException();
-        public Task<string> ReembolsarAsync(string referencia, decimal valor, string idempotencyKey, CancellationToken ct) => Task.FromException<string>(new HttpRequestException("provider down"));
+        public Task<string> ReembolsarAsync(string referencia, decimal valor, string idempotencyKey, CancellationToken ct) => Task.FromException<string>(new HttpRequestException("provider refused", null, HttpStatusCode.UnprocessableEntity));
         public Task<(Guid PagamentoId, StatusPagamento Status, string Referencia)?> ConsultarPagamentoAsync(string id, CancellationToken ct) => throw new NotSupportedException();
+    }
+
+    private sealed class ScriptedProvider(Func<int, string, Task<string>> onRefund) : ICheckoutProvider
+    {
+        public int RefundCalls { get; private set; }
+        public List<string> Keys { get; } = [];
+        public Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, CancellationToken ct) => throw new RespostaProvedorInvalidaException("mercado-pago", "campo 'init_point' ausente ou inválido.");
+        public Task<string> ReembolsarAsync(string referencia, decimal valor, string idempotencyKey, CancellationToken ct) { RefundCalls++; Keys.Add(idempotencyKey); return onRefund(RefundCalls, idempotencyKey); }
+        public Task<(Guid PagamentoId, StatusPagamento Status, string Referencia)?> ConsultarPagamentoAsync(string id, CancellationToken ct) => throw new NotSupportedException();
+    }
+
+    private sealed class ProcessCrash : Exception;
+
+    private static (Store Store, Pagamento Payment) CapturedPayment()
+    {
+        var (store, _, payment) = SeedPayment(); payment.IniciarCheckout("https://checkout.example/1", "preference-1"); payment.AplicarEstado(StatusPagamento.Capturado, "provider-1");
+        return (store, payment);
+    }
+
+    // --- C7: reembolso seguro contra queda e contra compensacao indevida (achado N1)
+
+    [Fact]
+    public async Task ApprovedRefundAuditCrashBetweenReservationAndProviderCallKeepsPendingReservation()
+    {
+        var (store, payment) = CapturedPayment(); var alerts = new Alerts();
+        var provider = new ScriptedProvider((call, _) => call == 1 ? throw new ProcessCrash() : Task.FromResult("refund-1"));
+        var service = new BillingService(store, provider, new Publisher(), alerts, new Readiness(true));
+        await Assert.ThrowsAsync<ProcessCrash>(() => service.ReembolsarAsync(payment.Id, 250m, "admin", "ticket-crash", CancellationToken.None));
+        var reserved = Assert.Single(payment.Reembolsos);
+        Assert.Equal(EstadoReembolso.Pendente, reserved.Estado); Assert.Equal(StatusPagamento.Capturado, payment.Status); Assert.Equal(1, alerts.Count);
+        // Retomada com a mesma referencia: mesma chave, sem segundo registro, e o pagamento passa a Reembolsado.
+        var resumed = await service.ReembolsarAsync(payment.Id, 250m, "admin", "ticket-crash", CancellationToken.None);
+        Assert.Same(reserved, resumed); Assert.Single(payment.Reembolsos); Assert.Equal(EstadoReembolso.Confirmado, resumed.Estado);
+        Assert.Equal(StatusPagamento.Reembolsado, payment.Status); Assert.Equal(2, provider.RefundCalls); Assert.Single(provider.Keys.Distinct());
+    }
+
+    [Fact]
+    public async Task ApprovedRefundAuditTimeoutThenResumeWithSameReferenceDoesNotDuplicateRefund()
+    {
+        var (store, payment) = CapturedPayment(); var alerts = new Alerts(); var keys = new List<string>(); var succeeded = 0; var timeouts = true;
+        var handler = new FakeHandler(_ =>
+        {
+            if (timeouts) throw new TaskCanceledException();
+            succeeded++; return Json(HttpStatusCode.Created, """{"id":987}""");
+        });
+        var client = new MercadoPagoClient(new HttpClient(new RecordingHandler(handler, keys)), Config(("MercadoPago:AccessToken", "token")), alerts, _ => TimeSpan.Zero);
+        var service = new BillingService(store, client, new Publisher(), alerts, new Readiness(true));
+        await Assert.ThrowsAsync<DependenciaIndisponivelException>(() => service.ReembolsarAsync(payment.Id, 250m, "admin", "ticket-timeout", CancellationToken.None));
+        var reserved = Assert.Single(payment.Reembolsos);
+        Assert.Equal(EstadoReembolso.Pendente, reserved.Estado); Assert.Equal(StatusPagamento.Capturado, payment.Status);
+        Assert.Equal(5, handler.Calls); Assert.Equal(2, alerts.Count); // esgotamento do retry + desfecho incerto
+        timeouts = false;
+        var resumed = await service.ReembolsarAsync(payment.Id, 250m, "admin", "ticket-timeout", CancellationToken.None);
+        Assert.Same(reserved, resumed); Assert.Single(payment.Reembolsos); Assert.Equal(1, succeeded);
+        Assert.Equal(EstadoReembolso.Confirmado, resumed.Estado); Assert.Equal(StatusPagamento.Reembolsado, payment.Status);
+        Assert.Single(keys.Distinct()); Assert.Equal(6, handler.Calls);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.ReembolsarAsync(payment.Id, 250m, "admin", "ticket-timeout", CancellationToken.None));
+        Assert.Equal(6, handler.Calls);
+    }
+
+    private sealed class RecordingHandler(HttpMessageHandler inner, List<string> keys) : DelegatingHandler(inner)
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        { keys.Add(request.Headers.GetValues("X-Idempotency-Key").Single()); return base.SendAsync(request, cancellationToken); }
+    }
+
+    [Fact]
+    public async Task ApprovedRefundAuditNewReferenceWhilePendingNeverExceedsTotal()
+    {
+        var (store, payment) = CapturedPayment();
+        var provider = new ScriptedProvider((call, _) => call == 1 ? throw new ProcessCrash() : Task.FromResult("refund-ok"));
+        var service = new BillingService(store, provider, new Publisher(), new Alerts(), new Readiness(true));
+        await Assert.ThrowsAsync<ProcessCrash>(() => service.ReembolsarAsync(payment.Id, 200m, "admin", "ticket-pending", CancellationToken.None));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.ReembolsarAsync(payment.Id, 100m, "admin", "ticket-new", CancellationToken.None));
+        Assert.Equal(1, provider.RefundCalls); Assert.Single(payment.Reembolsos);
+        await service.ReembolsarAsync(payment.Id, 50m, "admin", "ticket-fits", CancellationToken.None);
+        Assert.Equal(StatusPagamento.Capturado, payment.Status); // o Pendente de 200 ainda nao foi confirmado
+        await service.ReembolsarAsync(payment.Id, 200m, "admin", "ticket-pending", CancellationToken.None);
+        Assert.Equal(250m, payment.Reembolsos.Sum(r => r.Valor)); Assert.Equal(StatusPagamento.Reembolsado, payment.Status);
+    }
+
+    [Fact]
+    public async Task ApprovedRefundAuditCancellationKeepsReservationPending()
+    {
+        var (store, payment) = CapturedPayment(); var alerts = new Alerts();
+        var provider = new ScriptedProvider((_, _) => throw new OperationCanceledException());
+        var service = new BillingService(store, provider, new Publisher(), alerts, new Readiness(true));
+        await Assert.ThrowsAsync<OperationCanceledException>(() => service.ReembolsarAsync(payment.Id, 10m, "admin", "ticket-cancel", CancellationToken.None));
+        Assert.Equal(EstadoReembolso.Pendente, Assert.Single(payment.Reembolsos).Estado); Assert.Equal(1, alerts.Count);
+    }
+
+    [Fact]
+    public async Task ApprovedRefundAuditPersistsPendingConfirmsAndCompensatesInPostgres()
+    {
+        await using var postgres = await StartPostgresAsync(); var gate = new SaveGate(); var alerts = new Alerts();
+        var provider = new ScriptedProvider((call, _) => call switch
+        {
+            1 => throw new DependenciaIndisponivelException("mercado-pago"),
+            2 => Task.FromResult("refund-2"),
+            _ => throw new HttpRequestException("provider refused", null, HttpStatusCode.UnprocessableEntity),
+        });
+        using var factory = new DbApiFactory(postgres.GetConnectionString(), gate, provider, new Publisher(), alerts, new Readiness(true));
+        await MigrateAsync(factory); var (_, paymentId, _) = await SeedApprovedBudgetInDb(factory, capture: true);
+        using var client = Authorized(factory.CreateClient()); var route = $"/api/v1/pagamentos/{paymentId}/reembolsos";
+        Task<List<Reembolso>> Rows() => InDbAsync(factory, db => db.Reembolsos.AsNoTracking().Where(r => r.PagamentoId == paymentId).ToListAsync());
+        Task<StatusPagamento> PaymentStatus() => InDbAsync(factory, async db => (await db.Pagamentos.AsNoTracking().SingleAsync(p => p.Id == paymentId)).Status);
+        // 1) reserva persistida como Pendente e provedor incerto: 503, nada desfeito
+        var uncertain = await client.PostAsJsonAsync(route, new { valor = 100m, referencia = "ticket-1" });
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, uncertain.StatusCode); Assert.Equal(1, alerts.Count);
+        var pending = Assert.Single(await Rows()); Assert.Equal(EstadoReembolso.Pendente, pending.Estado); Assert.Equal(100m, pending.Valor);
+        Assert.Equal(StatusPagamento.Capturado, await PaymentStatus());
+        // 2) retomada com a mesma referencia confirma a mesma linha
+        Assert.Equal(HttpStatusCode.Created, (await client.PostAsJsonAsync(route, new { valor = 100m, referencia = "ticket-1" })).StatusCode);
+        var confirmed = Assert.Single(await Rows()); Assert.Equal(pending.Id, confirmed.Id); Assert.Equal(EstadoReembolso.Confirmado, confirmed.Estado);
+        Assert.Equal(provider.Keys[0], provider.Keys[1]);
+        // 3) falha definitiva (4xx) compensa: a linha reservada some
+        Assert.Equal(HttpStatusCode.BadGateway, (await client.PostAsJsonAsync(route, new { valor = 50m, referencia = "ticket-2" })).StatusCode);
+        Assert.Equal(confirmed.Id, Assert.Single(await Rows()).Id); Assert.Equal(StatusPagamento.Capturado, await PaymentStatus());
+    }
+
+    [Fact]
+    public async Task ApprovedRefundAuditInvalidProviderResponseKeepsPendingAndReturns502()
+    {
+        var (store, payment) = CapturedPayment(); var alerts = new Alerts();
+        var provider = new ScriptedProvider((_, _) => throw new RespostaProvedorInvalidaException("mercado-pago", "campo 'id' ausente ou inválido."));
+        using var factory = new BillingApiFactory(store, provider, new Publisher(), alerts, new Readiness(true)); using var client = Authorized(factory.CreateClient());
+        var response = await client.PostAsJsonAsync($"/api/v1/pagamentos/{payment.Id}/reembolsos", new { valor = 10m, referencia = "ticket-invalid-body" });
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Equal("resposta_provedor_invalida", (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("codigo").GetString());
+        Assert.Equal(EstadoReembolso.Pendente, Assert.Single(payment.Reembolsos).Estado); Assert.Equal(1, alerts.Count);
+    }
+
+    [Fact]
+    public async Task CreatesSingleCheckoutAttemptInvalidProviderResponseReturns502NotFound()
+    {
+        var (store, _, payment) = SeedPayment(); var provider = new ScriptedProvider((_, _) => Task.FromResult("x"));
+        using var factory = new BillingApiFactory(store, provider, new Publisher(), new Alerts(), new Readiness(true)); using var client = Authorized(factory.CreateClient());
+        var response = await client.PostAsync($"/api/v1/pagamentos/{payment.Id}/checkout", null);
+        Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+        Assert.Equal("resposta_provedor_invalida", (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("codigo").GetString());
+        Assert.Equal(StatusPagamento.SemTentativa, payment.Status);
+    }
+
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("""{"init_point":"https://x"}""")]
+    [InlineData("not-json")]
+    public async Task DependencyRetryExhaustionInvalidProviderBodyIsNotRetried(string body)
+    {
+        var alerts = new Alerts(); var handler = new FakeHandler(_ => Json(HttpStatusCode.OK, body));
+        await Assert.ThrowsAsync<RespostaProvedorInvalidaException>(() => MercadoPago(handler, alerts).CriarCheckoutAsync(Guid.NewGuid(), 10m, CancellationToken.None));
+        await Assert.ThrowsAsync<RespostaProvedorInvalidaException>(() => MercadoPago(handler, alerts).ReembolsarAsync("p", 1m, "k", CancellationToken.None));
+        Assert.Equal(2, handler.Calls); Assert.Equal(0, alerts.Count);
+        var missingStatus = new FakeHandler(_ => Json(HttpStatusCode.OK, $$"""{"external_reference":"{{Guid.NewGuid()}}"}"""));
+        await Assert.ThrowsAsync<RespostaProvedorInvalidaException>(() => MercadoPago(missingStatus, alerts).ConsultarPagamentoAsync("p", CancellationToken.None));
+    }
+
+    // --- C8: timeout do HttpClient e transitorio; cancelamento do chamador propaga (achado N2)
+
+    [Fact]
+    public async Task DependencyRetryExhaustionTimeoutCountsAsTransientFailure()
+    {
+        var alerts = new Alerts(); var handler = new FakeHandler(_ => throw new TaskCanceledException("timeout", new TimeoutException()));
+        var error = await Assert.ThrowsAsync<DependenciaIndisponivelException>(() => MercadoPago(handler, alerts).ConsultarPagamentoAsync("mp-1", CancellationToken.None));
+        Assert.Equal("mercado-pago", error.Dependencia); Assert.Equal(5, handler.Calls); Assert.Equal(1, alerts.Count);
+        var recovering = new FakeHandler(call => call < 3 ? throw new TaskCanceledException() : Json(HttpStatusCode.OK, $$"""{"external_reference":"{{Guid.NewGuid()}}","status":"approved"}"""));
+        var result = await MercadoPago(recovering, alerts).ConsultarPagamentoAsync("mp-1", CancellationToken.None);
+        Assert.Equal(StatusPagamento.Capturado, result!.Value.Status); Assert.Equal(3, recovering.Calls); Assert.Equal(1, alerts.Count);
+        var os = new FakeHandler(_ => throw new TaskCanceledException());
+        await Assert.ThrowsAsync<DependenciaIndisponivelException>(() => OsReadiness(os, alerts).ServicoConcluidoAsync(Guid.NewGuid(), CancellationToken.None));
+        Assert.Equal(5, os.Calls); Assert.Equal(2, alerts.Count);
+    }
+
+    [Fact]
+    public async Task DependencyRetryExhaustionCallerCancellationPropagatesWithoutRetry()
+    {
+        using var cts = new CancellationTokenSource(); var alerts = new Alerts();
+        var handler = new FakeHandler(_ => { cts.Cancel(); throw new TaskCanceledException(null, null, cts.Token); });
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => MercadoPago(handler, alerts).ConsultarPagamentoAsync("mp-1", cts.Token));
+        Assert.Equal(1, handler.Calls); Assert.Equal(0, alerts.Count);
+    }
+
+    // --- C1/C7: tetos de valor (achado N3)
+
+    [Fact]
+    public async Task CreatesBudgetForOrderRejectsValueAboveNumericCeiling()
+    {
+        var store = new Store(); using var factory = new BillingApiFactory(store, new Provider(), new Publisher(), new Alerts(), new Readiness(true)); using var client = Authorized(factory.CreateClient(), "ServicoOS");
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, (await client.PostAsJsonAsync("/api/v1/orcamentos", new { ordemServicoId = Guid.NewGuid(), clienteId = Guid.NewGuid(), valor = 10_000_000_000_000_000m })).StatusCode);
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, (await client.PostAsJsonAsync("/api/v1/orcamentos", new { ordemServicoId = Guid.NewGuid(), clienteId = Guid.NewGuid(), valor = decimal.MaxValue })).StatusCode);
+        Assert.Empty(store.Items);
+        Assert.Throws<ArgumentException>(() => new Orcamento(Guid.NewGuid(), Guid.NewGuid(), 10_000_000_000_000_000m, DateTimeOffset.UtcNow));
+        Assert.Equal(HttpStatusCode.Created, (await client.PostAsJsonAsync("/api/v1/orcamentos", new { ordemServicoId = Guid.NewGuid(), clienteId = Guid.NewGuid(), valor = 9_999_999_999_999_999.99m })).StatusCode);
+    }
+
+    [Fact]
+    public async Task ApprovedRefundAuditHugeAmountReturns422WithoutOverflow()
+    {
+        var (store, payment) = CapturedPayment(); var provider = new Provider();
+        using var factory = new BillingApiFactory(store, provider, new Publisher(), new Alerts(), new Readiness(true)); using var client = Authorized(factory.CreateClient()); var route = $"/api/v1/pagamentos/{payment.Id}/reembolsos";
+        Assert.Equal(HttpStatusCode.Created, (await client.PostAsJsonAsync(route, new { valor = 100m, referencia = "ticket-partial" })).StatusCode);
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, (await client.PostAsJsonAsync(route, new { valor = decimal.MaxValue, referencia = "ticket-max" })).StatusCode);
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, (await client.PostAsJsonAsync(route, new { valor = 250.01m, referencia = "ticket-above-total" })).StatusCode);
+        Assert.Throws<ArgumentOutOfRangeException>(() => payment.Reembolsar(decimal.MaxValue, "admin", "ticket-domain", DateTimeOffset.UtcNow));
+        Assert.Equal(1, provider.RefundCalls); Assert.Single(payment.Reembolsos);
     }
 
     // --- C5: webhook fora de ordem nao reabre pagamento terminal (achado 5)
@@ -341,7 +546,7 @@ public sealed partial class BillingLifecycleTests
         }
     }
 
-    private sealed class DbApiFactory(string connectionString, SaveGate gate, Provider provider, Publisher publisher, Alerts alerts, IOrderReadiness readiness) : WebApplicationFactory<Program>
+    private sealed class DbApiFactory(string connectionString, SaveGate gate, ICheckoutProvider provider, Publisher publisher, Alerts alerts, IOrderReadiness readiness) : WebApplicationFactory<Program>
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
