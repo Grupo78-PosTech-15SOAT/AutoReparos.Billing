@@ -8,6 +8,7 @@ public sealed record EventoPagamento(Guid PagamentoId, string Status, string Ref
 public sealed record SolicitacaoReembolso(decimal Valor, string Referencia);
 
 public sealed class ConcorrenciaException(string mensagem, Exception? inner = null) : Exception(mensagem, inner);
+public sealed class PublicacaoResultadoException(string mensagem, Exception? inner = null) : InvalidOperationException(mensagem, inner);
 public sealed class DependenciaIndisponivelException(string dependencia, Exception? inner = null) : Exception($"Dependência indisponível: {dependencia}.", inner)
 {
     public string Dependencia { get; } = dependencia;
@@ -66,7 +67,10 @@ public sealed class BillingService(IBillingStore store, ICheckoutProvider provid
         }
         try { await publisher.PublicarAsync(new(pagamento.Id, status.ToString(), referencia), ct); pagamento.MarcarResultadoPublicado(); await store.SalvarAsync(ct); }
         catch (Exception ex) when (ex is not OperationCanceledException)
-        { await alerts.AlertarAsync("billing.payment_sync_failed", $"{pagamento.Id}: {ex.Message}", ct); throw; }
+        {
+            await alerts.AlertarAsync("billing.payment_sync_failed", $"{pagamento.Id}: {ex.Message}", ct);
+            throw new PublicacaoResultadoException($"Falha ao publicar o resultado do pagamento {pagamento.Id}.", ex);
+        }
     }
     public async Task<Reembolso> ReembolsarAsync(Guid pagamentoId, decimal valor, string aprovador, string referencia, CancellationToken ct)
     {

@@ -186,7 +186,7 @@ public sealed partial class BillingLifecycleTests
         var service = new BillingService(store, provider, publisher, alerts, new Readiness(true));
         var budget = await service.CriarOrcamentoAsync(new(Guid.NewGuid(), Guid.NewGuid(), 250m), CancellationToken.None); budget.Aprovar(); var payment = budget.Pagamento!;
         await service.AbrirCheckoutAsync(payment.Id, null, CancellationToken.None);
-        await Assert.ThrowsAsync<InvalidOperationException>(() => service.AplicarWebhookAsync(payment.Id, StatusPagamento.Capturado, "provider-1", CancellationToken.None));
+        await Assert.ThrowsAsync<PublicacaoResultadoException>(() => service.AplicarWebhookAsync(payment.Id, StatusPagamento.Capturado, "provider-1", CancellationToken.None));
         await service.AplicarWebhookAsync(payment.Id, StatusPagamento.Capturado, "provider-1", CancellationToken.None);
         await Assert.ThrowsAsync<InvalidOperationException>(() => service.AbrirCheckoutAsync(payment.Id, null, CancellationToken.None));
         Assert.Equal(StatusPagamento.Capturado, payment.Status); Assert.True(payment.ResultadoPublicado); Assert.Single(publisher.Events);

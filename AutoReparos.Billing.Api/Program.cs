@@ -122,6 +122,7 @@ app.MapPost("/api/v1/webhooks/mercado-pago", async (HttpRequest request, IWebhoo
         if (payment is null) return Results.UnprocessableEntity(new { codigo = "pagamento_provedor_invalido" });
         try { await service.AplicarWebhookAsync(payment.Value.PagamentoId, payment.Value.Status, payment.Value.Referencia, ct); }
         catch (KeyNotFoundException) { return Results.UnprocessableEntity(new { codigo = "pagamento_desconhecido" }); }
+        catch (PublicacaoResultadoException) { return Results.Json(new { codigo = "resultado_nao_publicado" }, statusCode: StatusCodes.Status503ServiceUnavailable); }
         catch (InvalidOperationException ex) { return Results.UnprocessableEntity(new { codigo = "transicao_invalida", detalhe = ex.Message }); }
         return Results.Accepted();
     }

@@ -273,7 +273,7 @@ public sealed partial class BillingLifecycleTests
         var provider = new Provider { WebhookResult = (payment.Id, StatusPagamento.Rejeitado, "mp-payment-1") }; var publisher = new Publisher(failAttempts: 1); var alerts = new Alerts();
         using var factory = new BillingApiFactory(store, provider, publisher, alerts, new Readiness(true));
         using var client = factory.CreateClient();
-        Assert.False((await SendWebhook(client)).IsSuccessStatusCode);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, (await SendWebhook(client)).StatusCode);
         Assert.Equal(StatusPagamento.Rejeitado, payment.Status); Assert.Empty(publisher.Events); Assert.Equal(1, alerts.Count);
         Assert.Equal(HttpStatusCode.Accepted, (await SendWebhook(client)).StatusCode);
         Assert.Equal(HttpStatusCode.Accepted, (await SendWebhook(client)).StatusCode);
