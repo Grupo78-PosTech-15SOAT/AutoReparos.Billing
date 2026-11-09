@@ -11,7 +11,7 @@ using Microsoft.Extensions.Logging;
 
 namespace AutoReparos.Billing.Infrastructure;
 
-public sealed class MercadoPagoClient(HttpClient http, IConfiguration config, IAlertSink alerts) : ICheckoutProvider
+public sealed class MercadoPagoClient(HttpClient http, IConfiguration config, IAlertSink alerts, Func<int, TimeSpan>? delay = null) : ICheckoutProvider
 {
     private string Token => config["MercadoPago:AccessToken"] ?? throw new InvalidOperationException("Mercado Pago não configurado.");
     public Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, CancellationToken ct) => RequestWithRetryAsync(
@@ -64,20 +64,33 @@ public sealed class MercadoPagoClient(HttpClient http, IConfiguration config, IA
         return status is null ? null : (paymentId, status.Value, id);
     }, ct);
 
-    private async Task<T> RequestWithRetryAsync<T>(string alertCode, Func<HttpRequestMessage> requestFactory,
-        Func<HttpResponseMessage, CancellationToken, Task<T>> read, CancellationToken ct)
+    private Task<T> RequestWithRetryAsync<T>(string alertCode, Func<HttpRequestMessage> requestFactory,
+        Func<HttpResponseMessage, CancellationToken, Task<T>> read, CancellationToken ct) =>
+        DependencyHttp.SendAsync(http, alerts, "mercado-pago", alertCode, requestFactory, read, ct, delay);
+}
+
+public static class DependencyHttp
+{
+    public static bool IsTransient(Exception ex) => ex is HttpRequestException { StatusCode: null } || ex is HttpRequestException requestError &&
+        requestError.StatusCode is { } status && (status == System.Net.HttpStatusCode.RequestTimeout ||
+        status == System.Net.HttpStatusCode.TooManyRequests || (int)status >= 500);
+
+    public static async Task<T> SendAsync<T>(HttpClient http, IAlertSink alerts, string dependencia, string alertCode, Func<HttpRequestMessage> requestFactory,
+        Func<HttpResponseMessage, CancellationToken, Task<T>> read, CancellationToken ct, Func<int, TimeSpan>? delay = null)
     {
         T? result = default;
-        await DependencyRetry.ExecuteAsync(async token =>
+        try
         {
-            using var request = requestFactory(); using var response = await http.SendAsync(request, token);
-            if (!response.IsSuccessStatusCode)
-                throw new HttpRequestException($"Mercado Pago respondeu {(int)response.StatusCode}.", null, response.StatusCode);
-            result = await read(response, token);
-        }, token => alerts.AlertarAsync(alertCode, "Tentativas de integração esgotadas.", token), ct,
-        transient: ex => ex is HttpRequestException { StatusCode: null } || ex is HttpRequestException requestError &&
-            requestError.StatusCode is { } status && (status == System.Net.HttpStatusCode.RequestTimeout ||
-            status == System.Net.HttpStatusCode.TooManyRequests || (int)status >= 500));
+            await DependencyRetry.ExecuteAsync(async token =>
+            {
+                using var request = requestFactory(); using var response = await http.SendAsync(request, token);
+                if (!response.IsSuccessStatusCode)
+                    throw new HttpRequestException($"{dependencia} respondeu {(int)response.StatusCode}.", null, response.StatusCode);
+                result = await read(response, token);
+            }, token => alerts.AlertarAsync(alertCode, "Tentativas de integração esgotadas.", token), ct, delay: delay, transient: IsTransient);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException && IsTransient(ex))
+        { throw new DependenciaIndisponivelException(dependencia, ex); }
         return result!;
     }
 }
@@ -162,16 +175,21 @@ public static class RetryDelayPolicy
     }
 }
 
-public sealed class OsReadinessClient(HttpClient http, IConfiguration config) : IOrderReadiness
+public sealed class OsReadinessClient(HttpClient http, IConfiguration config, IAlertSink alerts, Func<int, TimeSpan>? delay = null) : IOrderReadiness
 {
-    public async Task<bool> ServicoConcluidoAsync(Guid ordemServicoId, CancellationToken ct)
+    public Task<bool> ServicoConcluidoAsync(Guid ordemServicoId, CancellationToken ct)
     {
         var baseUrl = config["OsService:BaseUrl"] ?? throw new InvalidOperationException("OS Service não configurado.");
-        using var request = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl.TrimEnd('/')}/api/v1/ordens-servico/{ordemServicoId}");
-        var serviceToken = config["OsService:BearerToken"];
-        if (!string.IsNullOrWhiteSpace(serviceToken)) request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", serviceToken);
-        using var response = await http.SendAsync(request, ct);
-        response.EnsureSuccessStatusCode(); using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
-        return string.Equals(body.RootElement.GetProperty("status").GetString(), "Concluida", StringComparison.OrdinalIgnoreCase);
+        return DependencyHttp.SendAsync(http, alerts, "os-service", "billing.os_service.readiness_failed", () =>
+        {
+            var request = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl.TrimEnd('/')}/api/v1/ordens-servico/{ordemServicoId}");
+            var serviceToken = config["OsService:BearerToken"];
+            if (!string.IsNullOrWhiteSpace(serviceToken)) request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", serviceToken);
+            return request;
+        }, async (response, token) =>
+        {
+            using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
+            return string.Equals(body.RootElement.GetProperty("status").GetString(), "Concluida", StringComparison.OrdinalIgnoreCase);
+        }, ct, delay);
     }
 }

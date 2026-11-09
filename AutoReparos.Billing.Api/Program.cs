@@ -61,6 +61,14 @@ if (!app.Environment.IsEnvironment("Testing"))
     await scope.ServiceProvider.GetRequiredService<BillingDbContext>().Database.MigrateAsync();
 }
 if (app.Environment.IsDevelopment()) app.MapOpenApi();
+app.Use(async (context, next) =>
+{
+    try { await next(); }
+    catch (DependenciaIndisponivelException ex) when (!context.Response.HasStarted)
+    { context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable; await context.Response.WriteAsJsonAsync(new { codigo = "dependencia_indisponivel", dependencia = ex.Dependencia }); }
+    catch (ConcorrenciaException) when (!context.Response.HasStarted)
+    { context.Response.StatusCode = StatusCodes.Status409Conflict; await context.Response.WriteAsJsonAsync(new { codigo = "conflito_concorrencia" }); }
+});
 app.UseAuthentication(); app.UseAuthorization();
 
 var orcamentos = app.MapGroup("/api/v1/orcamentos").RequireAuthorization("OperarBilling");
@@ -94,7 +102,7 @@ pagamentos.MapPost("/{id:guid}/checkout", async (Guid id, HttpContext context, B
 pagamentos.MapPost("/{id:guid}/reembolsos", async (Guid id, SolicitacaoReembolso request, HttpContext context, BillingService service, CancellationToken ct) =>
 {
     var aprovador = context.User.FindFirst("sub")?.Value ?? context.User.Identity?.Name ?? "";
-    if (request.Valor <= 0 || string.IsNullOrWhiteSpace(request.Referencia)) return Results.UnprocessableEntity(new { codigo = "reembolso_invalido" });
+    if (request.Valor <= 0 || decimal.Round(request.Valor, 2) != request.Valor || string.IsNullOrWhiteSpace(request.Referencia) || string.IsNullOrWhiteSpace(aprovador)) return Results.UnprocessableEntity(new { codigo = "reembolso_invalido" });
     try { var r = await service.ReembolsarAsync(id, request.Valor, aprovador, request.Referencia, ct); return Results.Created($"/api/v1/pagamentos/{id}/reembolsos/{r.Id}", new { r.Id, r.PagamentoId, r.Valor, r.Aprovador, r.Referencia }); }
     catch (KeyNotFoundException) { return Results.NotFound(); }
     catch (InvalidOperationException ex) { return Results.Conflict(new { codigo = "reembolso_indisponivel", detalhe = ex.Message }); }

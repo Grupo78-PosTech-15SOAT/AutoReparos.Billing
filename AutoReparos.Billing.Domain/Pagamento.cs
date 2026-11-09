@@ -12,15 +12,17 @@ public sealed class Pagamento
     public string? UrlCheckout { get; private set; }
     public string? ReferenciaProvedor { get; private set; }
     public bool ResultadoPublicado { get; private set; }
+    public int Revisao { get; private set; }
     public ICollection<Reembolso> Reembolsos => _reembolsos;
     public void IniciarCheckout(string url, string referencia)
     {
         if (Status is StatusPagamento.Pendente or StatusPagamento.Capturado or StatusPagamento.Reembolsado) throw new InvalidOperationException("Já existe tentativa ativa, pagamento capturado ou reembolsado.");
         if (string.IsNullOrWhiteSpace(url) || string.IsNullOrWhiteSpace(referencia)) throw new ArgumentException("Checkout e referência do provedor são obrigatórios.");
-        UrlCheckout = url; ReferenciaProvedor = referencia; Status = StatusPagamento.Pendente;
+        UrlCheckout = url; ReferenciaProvedor = referencia; Status = StatusPagamento.Pendente; Revisao++;
     }
-    public void AplicarEstado(StatusPagamento status, string referencia)
+    public bool AplicarEstado(StatusPagamento status, string referencia)
     {
+        if (status == StatusPagamento.Pendente && Status is StatusPagamento.Rejeitado or StatusPagamento.Cancelado or StatusPagamento.Expirado) return false;
         if (Status == StatusPagamento.Capturado && status != StatusPagamento.Capturado) throw new InvalidOperationException("Pagamento capturado é terminal.");
         if (Status == StatusPagamento.Reembolsado && status != StatusPagamento.Reembolsado) throw new InvalidOperationException("Pagamento reembolsado é terminal.");
         if (status is StatusPagamento.Rejeitado or StatusPagamento.Cancelado or StatusPagamento.Expirado && Status != StatusPagamento.Pendente && status != Status)
@@ -30,9 +32,16 @@ public sealed class Pagamento
         if (status == StatusPagamento.Reembolsado && Status != StatusPagamento.Capturado)
             throw new InvalidOperationException("Reembolso externo exige pagamento capturado.");
         Status = status; ReferenciaProvedor = referencia;
-        ResultadoPublicado = false;
+        ResultadoPublicado = false; Revisao++;
+        return true;
     }
-    public void MarcarResultadoPublicado() => ResultadoPublicado = true;
+    public void MarcarResultadoPublicado() { ResultadoPublicado = true; Revisao++; }
+    public void DesfazerReembolso(Reembolso reembolso)
+    {
+        if (!_reembolsos.Remove(reembolso)) return;
+        if (Status == StatusPagamento.Reembolsado) Status = StatusPagamento.Capturado;
+        Revisao++;
+    }
     public Reembolso Reembolsar(decimal valor, string aprovador, string referencia, DateTimeOffset quando)
     {
         var jaReembolsado = _reembolsos.Sum(r => r.Valor);
@@ -40,6 +49,7 @@ public sealed class Pagamento
             string.IsNullOrWhiteSpace(aprovador) || string.IsNullOrWhiteSpace(referencia) || _reembolsos.Any(r => r.Referencia == referencia))
             throw new InvalidOperationException("Reembolso inválido.");
         var reembolso = new Reembolso(Id, valor, aprovador, referencia, quando); _reembolsos.Add(reembolso);
+        Revisao++;
         if (valor + jaReembolsado == Valor) Status = StatusPagamento.Reembolsado;
         return reembolso;
     }
