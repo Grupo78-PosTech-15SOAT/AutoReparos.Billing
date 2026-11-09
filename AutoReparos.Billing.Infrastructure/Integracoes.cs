@@ -124,7 +124,7 @@ public sealed class SqsResultPublisher(IAmazonSQS sqs, IConfiguration config, IL
                         throw;
                     }
                 }
-                await Task.Delay(TimeSpan.FromMilliseconds(Math.Min(5000, 100 * (1 << (attempt - 1)) + Random.Shared.Next(0, 100))), ct);
+                  await Task.Delay(RetryDelayPolicy.Calculate(attempt, Random.Shared.Next(0, 100)), ct);
             }
         }
     }
@@ -146,10 +146,19 @@ public static class DependencyRetry
             catch (Exception ex) when (ex is not OperationCanceledException && (transient?.Invoke(ex) ?? true))
             {
                 if (attempt >= maxAttempts) { await exhausted(ct); throw; }
-                var wait = delay?.Invoke(attempt) ?? TimeSpan.FromMilliseconds(Math.Min(5000, 100 * (1 << (attempt - 1)) + Random.Shared.Next(0, 100)));
+                  var wait = delay?.Invoke(attempt) ?? RetryDelayPolicy.Calculate(attempt, Random.Shared.Next(0, 100));
                 await Task.Delay(wait, ct);
             }
         }
+    }
+}
+
+public static class RetryDelayPolicy
+{
+    public static TimeSpan Calculate(int attempt, int jitterMilliseconds)
+    {
+        if (attempt < 1 || jitterMilliseconds is < 0 or >= 100) throw new ArgumentOutOfRangeException();
+        return TimeSpan.FromMilliseconds(Math.Min(5000, 100 * (1 << Math.Min(attempt - 1, 30)) + jitterMilliseconds));
     }
 }
 

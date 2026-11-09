@@ -1,6 +1,10 @@
 using AutoReparos.Billing.Application;
 using AutoReparos.Billing.Domain;
 using AutoReparos.Billing.Infrastructure;
+using Amazon;
+using Amazon.Runtime;
+using Amazon.SQS;
+using Amazon.SQS.Model;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -33,9 +37,10 @@ public sealed class BillingLifecycleTests
     private sealed class Provider : ICheckoutProvider
     {
         public int Checkouts { get; private set; }
+        public int RefundCalls { get; private set; }
         public (Guid PagamentoId, StatusPagamento Status, string Referencia)? WebhookResult { get; set; }
         public Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, CancellationToken ct) { Checkouts++; return Task.FromResult(new AbrirCheckout("https://checkout.example/1", pagamentoId.ToString())); }
-        public Task<string> ReembolsarAsync(string referencia, decimal valor, string idempotencyKey, CancellationToken ct) => Task.FromResult("refund-123");
+        public Task<string> ReembolsarAsync(string referencia, decimal valor, string idempotencyKey, CancellationToken ct) { RefundCalls++; return Task.FromResult("refund-123"); }
         public Task<(Guid PagamentoId, StatusPagamento Status, string Referencia)?> ConsultarPagamentoAsync(string id, CancellationToken ct) => Task.FromResult(WebhookResult);
     }
     private sealed class Publisher(int failAttempts = 0) : IResultadoPublisher
@@ -56,8 +61,8 @@ public sealed class BillingLifecycleTests
         var budget = await service.CriarOrcamentoAsync(new(Guid.NewGuid(), Guid.NewGuid(), 250m), CancellationToken.None);
         budget.Aprovar(); return budget.Pagamento!;
     }
-    private static HttpClient Authorized(HttpClient client, string role = "Administrador")
-    { client.DefaultRequestHeaders.Add("X-Test-Role", role); return client; }
+    private static HttpClient Authorized(HttpClient client, string role = "Administrador", Guid? clienteId = null)
+    { client.DefaultRequestHeaders.Add("X-Test-Role", role); if (clienteId is not null) client.DefaultRequestHeaders.Add("X-Test-Cliente", clienteId.ToString()!); return client; }
 
     [Fact]
     public async Task CreatesBudgetForOrder()
@@ -72,6 +77,17 @@ public sealed class BillingLifecycleTests
         Assert.Equal(HttpStatusCode.UnprocessableEntity, (await client.PostAsJsonAsync("/api/v1/orcamentos", new { request.ordemServicoId, request.clienteId, valor = 0m })).StatusCode);
         var response = await client.PostAsJsonAsync("/api/v1/orcamentos", request);
         Assert.Equal(HttpStatusCode.Created, response.StatusCode); Assert.Single(store.Items); Assert.Equal(StatusOrcamento.Pendente, store.Items[0].Status);
+        var created = await response.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>(); var budgetId = created.GetProperty("id").GetGuid();
+        Assert.Equal($"/api/v1/orcamentos/{budgetId}/aprovacao", created.GetProperty("approvalUrl").GetString());
+        client.DefaultRequestHeaders.Remove("X-Test-Role");
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.PostAsync($"/api/v1/orcamentos/{budgetId}/aprovacao", null)).StatusCode);
+        Authorized(client, "Cliente", Guid.NewGuid());
+        Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsync($"/api/v1/orcamentos/{budgetId}/aprovacao", null)).StatusCode);
+        client.DefaultRequestHeaders.Remove("X-Test-Cliente"); client.DefaultRequestHeaders.Add("X-Test-Cliente", request.clienteId.ToString());
+        var approved = await client.PostAsync($"/api/v1/orcamentos/{budgetId}/aprovacao", null);
+        Assert.Equal(HttpStatusCode.OK, approved.StatusCode); Assert.Equal(StatusOrcamento.Aprovado, store.Items[0].Status);
+        Assert.Equal(HttpStatusCode.Conflict, (await client.PostAsync($"/api/v1/orcamentos/{budgetId}/aprovacao", null)).StatusCode);
+        Assert.Equal(HttpStatusCode.NotFound, (await client.PostAsync($"/api/v1/orcamentos/{Guid.NewGuid()}/aprovacao", null)).StatusCode);
     }
 
     [Fact]
@@ -97,6 +113,8 @@ public sealed class BillingLifecycleTests
         var first = await client.PostAsync($"/api/v1/pagamentos/{payment.Id}/checkout", null);
         var second = await client.PostAsync($"/api/v1/pagamentos/{payment.Id}/checkout", null);
         Assert.Equal(HttpStatusCode.OK, first.StatusCode); Assert.Equal(HttpStatusCode.OK, second.StatusCode);
+        Assert.Equal("https://checkout.example/1", (await first.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>()).GetProperty("urlCheckout").GetString());
+        Assert.Equal(HttpStatusCode.NotFound, (await client.PostAsync($"/api/v1/pagamentos/{Guid.NewGuid()}/checkout", null)).StatusCode);
         Assert.Equal(1, provider.Checkouts); Assert.Equal(StatusPagamento.Pendente, payment.Status);
     }
 
@@ -124,6 +142,10 @@ public sealed class BillingLifecycleTests
         { Content = JsonContent.Create(new { data = new { id = "payment-1" } }) };
         invalid.Headers.Add("x-signature", "ts=broken,v1=xyz"); invalid.Headers.Add("x-request-id", "request-1");
         Assert.Equal(HttpStatusCode.Unauthorized, (await client.SendAsync(invalid)).StatusCode);
+        using var wrongDigest = new HttpRequestMessage(HttpMethod.Post, "/api/v1/webhooks/mercado-pago") { Content = JsonContent.Create(new { data = new { id = "payment-1" } }) };
+        wrongDigest.Headers.Add("x-signature", $"ts={timestamp},v1={new string('0', 64)}"); wrongDigest.Headers.Add("x-request-id", "request-1");
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.SendAsync(wrongDigest)).StatusCode);
+        Assert.Equal(StatusPagamento.Capturado, payment.Status); Assert.Single(publisher.Events);
     }
 
     [Fact]
@@ -151,10 +173,10 @@ public sealed class BillingLifecycleTests
         var store = new Store(); var provider = new Provider(); var publisher = new Publisher(failAttempts: 1); var alerts = new Alerts();
         var service = new BillingService(store, provider, publisher, alerts, new Readiness(true));
         var budget = await service.CriarOrcamentoAsync(new(Guid.NewGuid(), Guid.NewGuid(), 250m), CancellationToken.None); budget.Aprovar(); var payment = budget.Pagamento!;
-        await service.AbrirCheckoutAsync(payment.Id, CancellationToken.None);
+        await service.AbrirCheckoutAsync(payment.Id, null, CancellationToken.None);
         await Assert.ThrowsAsync<InvalidOperationException>(() => service.AplicarWebhookAsync(payment.Id, StatusPagamento.Capturado, "provider-1", CancellationToken.None));
         await service.AplicarWebhookAsync(payment.Id, StatusPagamento.Capturado, "provider-1", CancellationToken.None);
-        await Assert.ThrowsAsync<InvalidOperationException>(() => service.AbrirCheckoutAsync(payment.Id, CancellationToken.None));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.AbrirCheckoutAsync(payment.Id, null, CancellationToken.None));
         Assert.Equal(StatusPagamento.Capturado, payment.Status); Assert.True(payment.ResultadoPublicado); Assert.Single(publisher.Events);
         Assert.Equal(1, provider.Checkouts); Assert.Equal(1, alerts.Count); Assert.Empty(payment.Reembolsos);
     }
@@ -174,6 +196,15 @@ public sealed class BillingLifecycleTests
         var result = await response.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>();
         Assert.Equal(75m, result.GetProperty("valor").GetDecimal()); Assert.Equal("test-user", result.GetProperty("aprovador").GetString());
         Assert.Equal("ticket-42", result.GetProperty("referencia").GetString());
+        Assert.Equal(HttpStatusCode.Conflict, (await client.PostAsJsonAsync(route, body)).StatusCode); Assert.Equal(1, provider.RefundCalls);
+        Assert.Equal(HttpStatusCode.Conflict, (await client.PostAsJsonAsync(route, new { valor = 175.01m, referencia = "ticket-over" })).StatusCode);
+        Assert.Equal(HttpStatusCode.Created, (await client.PostAsJsonAsync(route, new { valor = 175m, referencia = "ticket-final" })).StatusCode);
+        Assert.Equal(StatusPagamento.Reembolsado, payment.Status); Assert.Equal(2, payment.Reembolsos.Count);
+
+        var fullBudget = new Orcamento(Guid.NewGuid(), Guid.NewGuid(), 250m, DateTimeOffset.UtcNow); fullBudget.Aprovar(); store.Items.Add(fullBudget);
+        var fullPayment = fullBudget.Pagamento!; fullPayment.IniciarCheckout("https://checkout.example/2", "preference-2"); fullPayment.AplicarEstado(StatusPagamento.Capturado, "provider-2");
+        var fullResponse = await client.PostAsJsonAsync($"/api/v1/pagamentos/{fullPayment.Id}/reembolsos", new { valor = 250m, referencia = "ticket-full" });
+        Assert.Equal(HttpStatusCode.Created, fullResponse.StatusCode); Assert.Equal(StatusPagamento.Reembolsado, fullPayment.Status);
     }
 
     [Fact]
@@ -184,6 +215,26 @@ public sealed class BillingLifecycleTests
             _ => { attempts++; return Task.FromException(new InvalidOperationException("transient")); },
             _ => { exhausted++; return Task.CompletedTask; }, CancellationToken.None, 3, _ => TimeSpan.Zero));
         Assert.Equal(3, attempts); Assert.Equal(1, exhausted);
+        Assert.Equal(TimeSpan.FromMilliseconds(100), RetryDelayPolicy.Calculate(1, 0));
+        Assert.Equal(TimeSpan.FromMilliseconds(299), RetryDelayPolicy.Calculate(2, 99));
+        Assert.Equal(TimeSpan.FromMilliseconds(5000), RetryDelayPolicy.Calculate(10, 0));
+        var sqs = new RecordingSqs(); var alerts = new Alerts();
+        var publisher = new SqsResultPublisher(sqs,
+            new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?> { ["Sqs:QueueUrl"] = "main", ["Sqs:DeadLetterQueueUrl"] = "dlq" }).Build(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<SqsResultPublisher>.Instance, alerts);
+        await publisher.PublicarAsync(new EventoPagamento(Guid.NewGuid(), "Capturado", "provider-1"), CancellationToken.None);
+        Assert.Equal(5, sqs.MainAttempts); Assert.Equal(1, sqs.DeadLetterAttempts); Assert.Equal(1, alerts.Count);
+    }
+
+    private sealed class RecordingSqs() : AmazonSQSClient(new AnonymousAWSCredentials(), new AmazonSQSConfig { RegionEndpoint = RegionEndpoint.USEast1 })
+    {
+        public int MainAttempts { get; private set; }
+        public int DeadLetterAttempts { get; private set; }
+        public override Task<SendMessageResponse> SendMessageAsync(SendMessageRequest request, CancellationToken cancellationToken = default)
+        {
+            if (request.QueueUrl == "main") { MainAttempts++; return Task.FromException<SendMessageResponse>(new InvalidOperationException("queue unavailable")); }
+            DeadLetterAttempts++; return Task.FromResult(new SendMessageResponse());
+        }
     }
 
     private sealed class BillingApiFactory(Store store, Provider provider, Publisher publisher, Alerts alerts, Readiness readiness) : WebApplicationFactory<Program>
@@ -214,7 +265,8 @@ public sealed class BillingLifecycleTests
         {
             var role = Request.Headers["X-Test-Role"].FirstOrDefault();
             if (string.IsNullOrWhiteSpace(role)) return Task.FromResult(AuthenticateResult.NoResult());
-            var claims = new[] { new Claim(ClaimTypes.NameIdentifier, "test-user"), new Claim("sub", "test-user"), new Claim(ClaimTypes.Role, role) };
+            var claims = new List<Claim> { new(ClaimTypes.NameIdentifier, "test-user"), new("sub", "test-user"), new(ClaimTypes.Role, role) };
+            if (Guid.TryParse(Request.Headers["X-Test-Cliente"].FirstOrDefault(), out var clienteId)) claims.Add(new Claim("clienteId", clienteId.ToString()));
             var identity = new ClaimsIdentity(claims, Scheme.Name, ClaimTypes.Name, ClaimTypes.Role);
             return Task.FromResult(AuthenticateResult.Success(new AuthenticationTicket(new ClaimsPrincipal(identity), Scheme.Name)));
         }

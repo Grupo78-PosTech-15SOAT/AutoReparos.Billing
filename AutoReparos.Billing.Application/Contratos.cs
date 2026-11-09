@@ -31,17 +31,19 @@ public sealed class BillingService(IBillingStore store, ICheckoutProvider provid
         var orcamento = new Orcamento(request.OrdemServicoId, request.ClienteId, request.Valor, DateTimeOffset.UtcNow);
         await store.AdicionarOrcamentoAsync(orcamento, ct); await store.SalvarAsync(ct); return orcamento;
     }
-    public async Task<Orcamento> AprovarOrcamentoAsync(Guid id, CancellationToken ct)
+    public async Task<Orcamento> AprovarOrcamentoAsync(Guid id, Guid clienteId, CancellationToken ct)
     {
         var orcamento = await store.ObterOrcamentoAsync(id, ct) ?? throw new KeyNotFoundException();
+        if (orcamento.ClienteId != clienteId) throw new UnauthorizedAccessException();
         orcamento.Aprovar(); await store.SalvarAsync(ct); return orcamento;
     }
-    public async Task<Pagamento> AbrirCheckoutAsync(Guid pagamentoId, CancellationToken ct)
+    public async Task<Pagamento> AbrirCheckoutAsync(Guid pagamentoId, Guid? clienteId, CancellationToken ct)
     {
         var pagamento = await store.ObterPagamentoAsync(pagamentoId, ct) ?? throw new KeyNotFoundException();
+        var orcamento = await store.ObterPorPagamentoAsync(pagamentoId, ct) ?? throw new KeyNotFoundException();
+        if (clienteId is not null && orcamento.ClienteId != clienteId) throw new UnauthorizedAccessException();
         if (pagamento.Status == StatusPagamento.Pendente) return pagamento;
         if (pagamento.Status == StatusPagamento.Capturado) throw new InvalidOperationException("Pagamento já capturado.");
-        var orcamento = await store.ObterPorPagamentoAsync(pagamentoId, ct) ?? throw new KeyNotFoundException();
         if (orcamento.Status != StatusOrcamento.Aprovado || !await readiness.ServicoConcluidoAsync(orcamento.OrdemServicoId, ct))
             throw new InvalidOperationException("Cobrança exige orçamento aprovado e serviço concluído.");
         var checkout = await provider.CriarCheckoutAsync(pagamento.Id, pagamento.Valor, ct);

@@ -36,7 +36,8 @@ public sealed class Pagamento
     public Reembolso Reembolsar(decimal valor, string aprovador, string referencia, DateTimeOffset quando)
     {
         var jaReembolsado = _reembolsos.Sum(r => r.Valor);
-        if (Status != StatusPagamento.Capturado || valor <= 0 || decimal.Round(valor, 2) != valor || valor + jaReembolsado > Valor || string.IsNullOrWhiteSpace(aprovador) || string.IsNullOrWhiteSpace(referencia))
+        if (Status != StatusPagamento.Capturado || valor <= 0 || decimal.Round(valor, 2) != valor || valor + jaReembolsado > Valor ||
+            string.IsNullOrWhiteSpace(aprovador) || string.IsNullOrWhiteSpace(referencia) || _reembolsos.Any(r => r.Referencia == referencia))
             throw new InvalidOperationException("Reembolso inválido.");
         var reembolso = new Reembolso(Id, valor, aprovador, referencia, quando); _reembolsos.Add(reembolso);
         if (valor + jaReembolsado == Valor) Status = StatusPagamento.Reembolsado;

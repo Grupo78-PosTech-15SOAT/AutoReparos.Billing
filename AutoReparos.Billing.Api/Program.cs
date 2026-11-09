@@ -25,6 +25,8 @@ builder.Services.AddAuthorization(options =>
     options.AddPolicy("ServicoOS", p => p.RequireRole("ServicoOS"));
     options.AddPolicy("OperarBilling", p => p.RequireRole("Administrador", "Atendente", "ServicoOS"));
     options.AddPolicy("AprovarReembolso", p => p.RequireRole("Administrador"));
+    options.AddPolicy("AprovarOrcamento", p => p.RequireRole("Cliente"));
+    options.AddPolicy("IniciarCheckout", p => p.RequireRole("Administrador", "Atendente", "Mecanico", "ServicoOS", "Cliente"));
 });
 
 var app = builder.Build();
@@ -42,22 +44,28 @@ orcamentos.MapPost("", async (CriarOrcamento request, BillingService service, Ca
     if (request.OrdemServicoId == Guid.Empty || request.ClienteId == Guid.Empty || request.Valor <= 0 || decimal.Round(request.Valor, 2) != request.Valor)
         return Results.UnprocessableEntity(new { codigo = "orcamento_invalido" });
     var result = await service.CriarOrcamentoAsync(request, ct);
-    return Results.Created($"/api/v1/orcamentos/{result.Id}", new { result.Id, result.OrdemServicoId, result.ClienteId, result.Valor, status = result.Status.ToString() });
+    return Results.Created($"/api/v1/orcamentos/{result.Id}", new { result.Id, result.OrdemServicoId, result.ClienteId, result.Valor, status = result.Status.ToString(), approvalUrl = $"/api/v1/orcamentos/{result.Id}/aprovacao" });
 });
-orcamentos.MapPost("/{id:guid}/aprovacao", async (Guid id, BillingService service, CancellationToken ct) =>
+app.MapPost("/api/v1/orcamentos/{id:guid}/aprovacao", async (Guid id, HttpContext context, BillingService service, CancellationToken ct) =>
 {
-    try { var result = await service.AprovarOrcamentoAsync(id, ct); return Results.Ok(new { result.Id, status = result.Status.ToString(), pagamentoId = result.Pagamento?.Id }); }
+    if (!Guid.TryParse(context.User.FindFirst("clienteId")?.Value, out var clienteId)) return Results.Forbid();
+    try { var result = await service.AprovarOrcamentoAsync(id, clienteId, ct); return Results.Ok(new { result.Id, status = result.Status.ToString(), pagamentoId = result.Pagamento?.Id }); }
     catch (KeyNotFoundException) { return Results.NotFound(); }
+    catch (UnauthorizedAccessException) { return Results.Forbid(); }
     catch (InvalidOperationException ex) { return Results.Conflict(new { codigo = "transicao_invalida", detalhe = ex.Message }); }
-});
+}).RequireAuthorization("AprovarOrcamento");
 
-var pagamentos = app.MapGroup("/api/v1/pagamentos").RequireAuthorization("OperarBilling");
-pagamentos.MapPost("/{id:guid}/checkout", async (Guid id, BillingService service, CancellationToken ct) =>
+var pagamentos = app.MapGroup("/api/v1/pagamentos");
+pagamentos.MapPost("/{id:guid}/checkout", async (Guid id, HttpContext context, BillingService service, CancellationToken ct) =>
 {
-    try { var p = await service.AbrirCheckoutAsync(id, ct); return Results.Ok(new { p.Id, p.UrlCheckout, status = p.Status.ToString() }); }
+    Guid? clienteId = null;
+    if (context.User.IsInRole("Cliente"))
+    { if (!Guid.TryParse(context.User.FindFirst("clienteId")?.Value, out var parsed)) return Results.Forbid(); clienteId = parsed; }
+    try { var p = await service.AbrirCheckoutAsync(id, clienteId, ct); return Results.Ok(new { p.Id, p.UrlCheckout, status = p.Status.ToString() }); }
     catch (KeyNotFoundException) { return Results.NotFound(); }
+    catch (UnauthorizedAccessException) { return Results.Forbid(); }
     catch (InvalidOperationException ex) { return Results.Conflict(new { codigo = "checkout_indisponivel", detalhe = ex.Message }); }
-});
+}).RequireAuthorization("IniciarCheckout");
 pagamentos.MapPost("/{id:guid}/reembolsos", async (Guid id, SolicitacaoReembolso request, HttpContext context, BillingService service, CancellationToken ct) =>
 {
     var aprovador = context.User.FindFirst("sub")?.Value ?? context.User.Identity?.Name ?? "";
