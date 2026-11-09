@@ -29,7 +29,7 @@ using System.Text.Encodings.Web;
 
 namespace AutoReparos.Billing.Tests;
 
-public sealed class BillingLifecycleTests
+public sealed partial class BillingLifecycleTests
 {
     private sealed class Store : IBillingStore
     {
@@ -279,7 +279,7 @@ public sealed class BillingLifecycleTests
         public List<LogRecord> Logs { get; } = [];
     }
 
-    private sealed class BillingApiFactory(Store store, Provider provider, Publisher publisher, Alerts alerts, Readiness readiness, TelemetryCapture? telemetry = null) : WebApplicationFactory<Program>
+    private sealed class BillingApiFactory(Store store, ICheckoutProvider provider, Publisher publisher, Alerts alerts, IOrderReadiness readiness, TelemetryCapture? telemetry = null) : WebApplicationFactory<Program>
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -318,7 +318,8 @@ public sealed class BillingLifecycleTests
         {
             var role = Request.Headers["X-Test-Role"].FirstOrDefault();
             if (string.IsNullOrWhiteSpace(role)) return Task.FromResult(AuthenticateResult.NoResult());
-            var claims = new List<Claim> { new(ClaimTypes.NameIdentifier, "test-user"), new("sub", "test-user"), new(ClaimTypes.Role, role) };
+            var claims = new List<Claim> { new(ClaimTypes.Role, role) };
+            if (!Request.Headers.ContainsKey("X-Test-NoSub")) { claims.Add(new(ClaimTypes.NameIdentifier, "test-user")); claims.Add(new("sub", "test-user")); }
             if (Guid.TryParse(Request.Headers["X-Test-Cliente"].FirstOrDefault(), out var clienteId)) claims.Add(new Claim("clienteId", clienteId.ToString()));
             var identity = new ClaimsIdentity(claims, Scheme.Name, ClaimTypes.Name, ClaimTypes.Role);
             return Task.FromResult(AuthenticateResult.Success(new AuthenticationTicket(new ClaimsPrincipal(identity), Scheme.Name)));
