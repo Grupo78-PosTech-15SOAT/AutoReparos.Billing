@@ -155,6 +155,11 @@ public sealed class BillingLifecycleTests
         var payment = budget.Pagamento!;
         using var factory = new BillingApiFactory(store, provider, new Publisher(), new Alerts(), new Readiness(true));
         using var client = Authorized(factory.CreateClient());
+        client.DefaultRequestHeaders.Remove("X-Test-Role");
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.PostAsync($"/api/v1/pagamentos/{payment.Id}/checkout", null)).StatusCode);
+        client.DefaultRequestHeaders.Add("X-Test-Role", "Cliente");
+        Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsync($"/api/v1/pagamentos/{payment.Id}/checkout", null)).StatusCode);
+        client.DefaultRequestHeaders.Remove("X-Test-Role"); client.DefaultRequestHeaders.Add("X-Test-Role", "Administrador");
         Assert.Equal(HttpStatusCode.OK, (await client.PostAsync($"/api/v1/pagamentos/{payment.Id}/checkout", null)).StatusCode);
         Assert.Equal(1, provider.Checkouts);
         payment.AplicarEstado(StatusPagamento.Rejeitado, "provider-1");
@@ -187,10 +192,13 @@ public sealed class BillingLifecycleTests
         var store = new Store(); var provider = new Provider(); var budget = new Orcamento(Guid.NewGuid(), Guid.NewGuid(), 250m, DateTimeOffset.UtcNow); budget.Aprovar(); store.Items.Add(budget);
         var payment = budget.Pagamento!; payment.IniciarCheckout("https://checkout.example/1", "preference-1"); payment.AplicarEstado(StatusPagamento.Capturado, "provider-1");
         using var factory = new BillingApiFactory(store, provider, new Publisher(), new Alerts(), new Readiness(true));
-        using var client = Authorized(factory.CreateClient(), "Atendente");
+        using var client = factory.CreateClient();
         var route = $"/api/v1/pagamentos/{payment.Id}/reembolsos"; var body = new { valor = 75m, referencia = "ticket-42" };
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.PostAsJsonAsync(route, body)).StatusCode);
+        Authorized(client, "Atendente");
         Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsJsonAsync(route, body)).StatusCode);
         client.DefaultRequestHeaders.Remove("X-Test-Role"); client.DefaultRequestHeaders.Add("X-Test-Role", "Administrador");
+        Assert.Equal(HttpStatusCode.NotFound, (await client.PostAsJsonAsync($"/api/v1/pagamentos/{Guid.NewGuid()}/reembolsos", body)).StatusCode);
         Assert.Equal(HttpStatusCode.UnprocessableEntity, (await client.PostAsJsonAsync(route, new { valor = 0m, referencia = "ticket-43" })).StatusCode);
         var response = await client.PostAsJsonAsync(route, body); Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         var result = await response.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>();
