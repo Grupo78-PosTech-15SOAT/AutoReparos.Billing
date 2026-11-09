@@ -124,7 +124,7 @@ public sealed class SqsResultPublisher(IAmazonSQS sqs, IConfiguration config, IL
                         throw;
                     }
                 }
-                  await Task.Delay(RetryDelayPolicy.Calculate(attempt, Random.Shared.Next(0, 100)), ct);
+                await Task.Delay(RetryDelayPolicy.Calculate(attempt, Random.Shared.Next(0, 100)), ct);
             }
         }
     }
@@ -146,7 +146,7 @@ public static class DependencyRetry
             catch (Exception ex) when (ex is not OperationCanceledException && (transient?.Invoke(ex) ?? true))
             {
                 if (attempt >= maxAttempts) { await exhausted(ct); throw; }
-                  var wait = delay?.Invoke(attempt) ?? RetryDelayPolicy.Calculate(attempt, Random.Shared.Next(0, 100));
+                var wait = delay?.Invoke(attempt) ?? RetryDelayPolicy.Calculate(attempt, Random.Shared.Next(0, 100));
                 await Task.Delay(wait, ct);
             }
         }
