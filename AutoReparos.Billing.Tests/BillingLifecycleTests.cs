@@ -49,9 +49,13 @@ public sealed partial class BillingLifecycleTests
         public List<string> CheckoutKeys { get; } = [];
         public Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, string idempotencyKey, CancellationToken ct)
         {
-            Checkouts++; CheckoutKeys.Add(idempotencyKey);
-            // Provedor falso: a mesma chave devolve a mesma preferencia; chave nova gera URL nova.
-            return Task.FromResult(new AbrirCheckout($"https://checkout.example/{CheckoutKeys.Distinct().ToList().IndexOf(idempotencyKey) + 1}", pagamentoId.ToString()));
+            // Requisicoes concorrentes chamam o provedor ao mesmo tempo: o registro das chaves precisa ser atomico.
+            lock (CheckoutKeys)
+            {
+                Checkouts++; CheckoutKeys.Add(idempotencyKey);
+                // Provedor falso: a mesma chave devolve a mesma preferencia; chave nova gera URL nova.
+                return Task.FromResult(new AbrirCheckout($"https://checkout.example/{CheckoutKeys.Distinct().ToList().IndexOf(idempotencyKey) + 1}", pagamentoId.ToString()));
+            }
         }
         public Task<string> ReembolsarAsync(string referencia, decimal valor, string idempotencyKey, CancellationToken ct) { RefundCalls++; return Task.FromResult("refund-123"); }
         public Task<(Guid PagamentoId, StatusPagamento Status, string Referencia)?> ConsultarPagamentoAsync(string id, CancellationToken ct) => Task.FromResult(WebhookResult);
