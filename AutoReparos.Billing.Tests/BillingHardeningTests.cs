@@ -126,7 +126,7 @@ public sealed partial class BillingLifecycleTests
         var error = await Assert.ThrowsAsync<DependenciaIndisponivelException>(() => MercadoPago(handler, alerts).ConsultarPagamentoAsync("mp-1", CancellationToken.None));
         Assert.Equal("mercado-pago", error.Dependencia); Assert.Equal(5, handler.Calls); Assert.Equal(1, alerts.Count);
         var checkoutHandler = new FakeHandler(_ => Json(status, "{}"));
-        await Assert.ThrowsAsync<DependenciaIndisponivelException>(() => MercadoPago(checkoutHandler, alerts).CriarCheckoutAsync(Guid.NewGuid(), 10m, CancellationToken.None));
+        await Assert.ThrowsAsync<DependenciaIndisponivelException>(() => MercadoPago(checkoutHandler, alerts).CriarCheckoutAsync(Guid.NewGuid(), 10m, "checkout-key", CancellationToken.None));
         Assert.Equal(5, checkoutHandler.Calls); Assert.Equal(2, alerts.Count);
     }
 
@@ -221,7 +221,7 @@ public sealed partial class BillingLifecycleTests
 
     private sealed class FailingRefundProvider : ICheckoutProvider
     {
-        public Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, CancellationToken ct) => throw new NotSupportedException();
+        public Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, string idempotencyKey, CancellationToken ct) => throw new NotSupportedException();
         public Task<string> ReembolsarAsync(string referencia, decimal valor, string idempotencyKey, CancellationToken ct) => Task.FromException<string>(new HttpRequestException("provider refused", null, HttpStatusCode.UnprocessableEntity));
         public Task<(Guid PagamentoId, StatusPagamento Status, string Referencia)?> ConsultarPagamentoAsync(string id, CancellationToken ct) => throw new NotSupportedException();
     }
@@ -230,7 +230,7 @@ public sealed partial class BillingLifecycleTests
     {
         public int RefundCalls { get; private set; }
         public List<string> Keys { get; } = [];
-        public Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, CancellationToken ct) => throw new RespostaProvedorInvalidaException("mercado-pago", "campo 'init_point' ausente ou inválido.");
+        public Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, string idempotencyKey, CancellationToken ct) => throw new RespostaProvedorInvalidaException("mercado-pago", "campo 'init_point' ausente ou inválido.");
         public Task<string> ReembolsarAsync(string referencia, decimal valor, string idempotencyKey, CancellationToken ct) { RefundCalls++; Keys.Add(idempotencyKey); return onRefund(RefundCalls, idempotencyKey); }
         public Task<(Guid PagamentoId, StatusPagamento Status, string Referencia)?> ConsultarPagamentoAsync(string id, CancellationToken ct) => throw new NotSupportedException();
     }
@@ -374,7 +374,7 @@ public sealed partial class BillingLifecycleTests
     public async Task DependencyRetryExhaustionInvalidProviderBodyIsNotRetried(string body)
     {
         var alerts = new Alerts(); var handler = new FakeHandler(_ => Json(HttpStatusCode.OK, body));
-        await Assert.ThrowsAsync<RespostaProvedorInvalidaException>(() => MercadoPago(handler, alerts).CriarCheckoutAsync(Guid.NewGuid(), 10m, CancellationToken.None));
+        await Assert.ThrowsAsync<RespostaProvedorInvalidaException>(() => MercadoPago(handler, alerts).CriarCheckoutAsync(Guid.NewGuid(), 10m, "checkout-key", CancellationToken.None));
         await Assert.ThrowsAsync<RespostaProvedorInvalidaException>(() => MercadoPago(handler, alerts).ReembolsarAsync("p", 1m, "k", CancellationToken.None));
         Assert.Equal(2, handler.Calls); Assert.Equal(0, alerts.Count);
         var missingStatus = new FakeHandler(_ => Json(HttpStatusCode.OK, $$"""{"external_reference":"{{Guid.NewGuid()}}"}"""));
@@ -608,6 +608,32 @@ public sealed partial class BillingLifecycleTests
         var checkoutsBefore = provider.Checkouts;
         Assert.Equal(HttpStatusCode.OK, (await a.PostAsync($"/api/v1/pagamentos/{paymentId}/checkout", null)).StatusCode);
         Assert.Equal(checkoutsBefore, provider.Checkouts);
+    }
+
+    [Fact]
+    public async Task CreatesSingleCheckoutAttemptSharesIdempotencyKeyAndPersistsAttemptCounterManualRetryAfterTerminalState()
+    {
+        await using var postgres = await StartPostgresAsync(); var gate = new SaveGate(); var provider = new Provider();
+        using var factory = new DbApiFactory(postgres.GetConnectionString(), gate, provider, new Publisher(), new Alerts(), new Readiness(true));
+        await MigrateAsync(factory); var (_, paymentId, _) = await SeedApprovedBudgetInDb(factory);
+        using var a = Authorized(factory.CreateClient()); using var b = Authorized(factory.CreateClient());
+        gate.Arm(2);
+        var responses = await Task.WhenAll(a.PostAsync($"/api/v1/pagamentos/{paymentId}/checkout", null), b.PostAsync($"/api/v1/pagamentos/{paymentId}/checkout", null));
+        gate.Arm(0);
+        Assert.Equal([200, 409], responses.Select(r => (int)r.StatusCode).Order().ToArray());
+        // As duas chamadas concorrentes da mesma tentativa usaram a mesma chave; so uma tentativa persistiu.
+        Assert.Equal(2, provider.CheckoutKeys.Count); Assert.Single(provider.CheckoutKeys.Distinct());
+        Assert.Equal($"checkout-{paymentId:N}-1", provider.CheckoutKeys[0]);
+        var firstUrl = (await InDbAsync(factory, db => db.Pagamentos.AsNoTracking().SingleAsync(p => p.Id == paymentId))).UrlCheckout;
+        Assert.Equal(1, (await InDbAsync(factory, db => db.Pagamentos.AsNoTracking().SingleAsync(p => p.Id == paymentId))).Tentativas);
+        // Estado terminal e retry manual: chave nova, URL nova, contador persistido em 2.
+        await InDbAsync(factory, async db => { var p = await db.Pagamentos.SingleAsync(x => x.Id == paymentId); p.AplicarEstado(StatusPagamento.Rejeitado, "provider-1"); await db.SaveChangesAsync(); return 0; });
+        var retry = await a.PostAsync($"/api/v1/pagamentos/{paymentId}/checkout", null);
+        Assert.Equal(HttpStatusCode.OK, retry.StatusCode);
+        Assert.Equal(3, provider.CheckoutKeys.Count); Assert.Equal($"checkout-{paymentId:N}-2", provider.CheckoutKeys[2]);
+        var persisted = await InDbAsync(factory, db => db.Pagamentos.AsNoTracking().SingleAsync(p => p.Id == paymentId));
+        Assert.Equal(2, persisted.Tentativas); Assert.Equal(StatusPagamento.Pendente, persisted.Status);
+        Assert.NotEqual(firstUrl, persisted.UrlCheckout); Assert.Equal("https://checkout.example/2", persisted.UrlCheckout);
     }
 
     [Fact]

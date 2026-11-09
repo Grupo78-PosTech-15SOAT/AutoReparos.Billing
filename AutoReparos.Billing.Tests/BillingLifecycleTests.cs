@@ -46,7 +46,13 @@ public sealed partial class BillingLifecycleTests
         public int Checkouts { get; private set; }
         public int RefundCalls { get; private set; }
         public (Guid PagamentoId, StatusPagamento Status, string Referencia)? WebhookResult { get; set; }
-        public Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, CancellationToken ct) { Checkouts++; return Task.FromResult(new AbrirCheckout("https://checkout.example/1", pagamentoId.ToString())); }
+        public List<string> CheckoutKeys { get; } = [];
+        public Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, string idempotencyKey, CancellationToken ct)
+        {
+            Checkouts++; CheckoutKeys.Add(idempotencyKey);
+            // Provedor falso: a mesma chave devolve a mesma preferencia; chave nova gera URL nova.
+            return Task.FromResult(new AbrirCheckout($"https://checkout.example/{CheckoutKeys.Distinct().ToList().IndexOf(idempotencyKey) + 1}", pagamentoId.ToString()));
+        }
         public Task<string> ReembolsarAsync(string referencia, decimal valor, string idempotencyKey, CancellationToken ct) { RefundCalls++; return Task.FromResult("refund-123"); }
         public Task<(Guid PagamentoId, StatusPagamento Status, string Referencia)?> ConsultarPagamentoAsync(string id, CancellationToken ct) => Task.FromResult(WebhookResult);
     }
@@ -191,6 +197,28 @@ public sealed partial class BillingLifecycleTests
         await Assert.ThrowsAsync<InvalidOperationException>(() => service.AbrirCheckoutAsync(payment.Id, null, CancellationToken.None));
         Assert.Equal(StatusPagamento.Capturado, payment.Status); Assert.True(payment.ResultadoPublicado); Assert.Single(publisher.Events);
         Assert.Equal(1, provider.Checkouts); Assert.Equal(1, alerts.Count); Assert.Empty(payment.Reembolsos);
+    }
+
+    [Theory]
+    [InlineData(StatusPagamento.Rejeitado)]
+    [InlineData(StatusPagamento.Cancelado)]
+    [InlineData(StatusPagamento.Expirado)]
+    public async Task ManualRetryAfterTerminalStateUsesNewIdempotencyKeyAndNewUrl(StatusPagamento terminal)
+    {
+        var (service, _, provider, _) = Setup();
+        var payment = await EligiblePayment(service);
+        var first = await service.AbrirCheckoutAsync(payment.Id, null, CancellationToken.None);
+        var firstUrl = first.UrlCheckout; var firstKey = Assert.Single(provider.CheckoutKeys);
+        Assert.Equal($"checkout-{payment.Id:N}-1", firstKey); Assert.Equal(1, payment.Tentativas);
+        // Chamada repetida durante a tentativa ativa nao cria outra nem consome tentativa.
+        await service.AbrirCheckoutAsync(payment.Id, null, CancellationToken.None);
+        Assert.Single(provider.CheckoutKeys); Assert.Equal(1, payment.Tentativas);
+        await service.AplicarWebhookAsync(payment.Id, terminal, "provider-1", CancellationToken.None);
+        var retry = await service.AbrirCheckoutAsync(payment.Id, null, CancellationToken.None);
+        Assert.Equal(2, provider.CheckoutKeys.Count); Assert.Equal($"checkout-{payment.Id:N}-2", provider.CheckoutKeys[1]);
+        Assert.NotEqual(firstKey, provider.CheckoutKeys[1]); Assert.NotEqual(firstUrl, retry.UrlCheckout);
+        Assert.Equal("https://checkout.example/2", retry.UrlCheckout);
+        Assert.Equal(StatusPagamento.Pendente, retry.Status); Assert.Equal(2, payment.Tentativas);
     }
 
     [Fact]
