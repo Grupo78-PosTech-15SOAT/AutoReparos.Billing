@@ -1,10 +1,35 @@
 using Amazon.SQS;
+using AutoReparos.Billing.Api;
 using AutoReparos.Billing.Application;
 using AutoReparos.Billing.Infrastructure;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
+using OpenTelemetry.Exporter;
+using OpenTelemetry.Logs;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Trace;
 
 var builder = WebApplication.CreateBuilder(args);
+var serviceName = builder.Configuration["Telemetry:ServiceName"] ?? "autoreparos-billing";
+var otlpEndpoint = builder.Configuration["Telemetry:OtlpEndpoint"] ?? "http://localhost:4317";
+builder.Services.AddOpenTelemetry()
+    .ConfigureResource(resource => TelemetriaBilling.Configurar(resource, serviceName, builder.Environment.EnvironmentName))
+    .WithTracing(tracing => tracing
+        .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation()
+        .AddOtlpExporter(options => options.Endpoint = new Uri(otlpEndpoint)))
+    .WithMetrics(metrics => metrics
+        .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation()
+        .AddRuntimeInstrumentation()
+        .AddOtlpExporter(options => options.Endpoint = new Uri(otlpEndpoint)));
+builder.Logging.AddOpenTelemetry(logging =>
+{
+    logging.IncludeFormattedMessage = true;
+    logging.IncludeScopes = true;
+    logging.ParseStateValues = true;
+    logging.AddOtlpExporter(options => options.Endpoint = new Uri(otlpEndpoint));
+});
 builder.Services.AddOpenApi();
 builder.Services.AddDbContext<BillingDbContext>(o => o.UseNpgsql(builder.Configuration.GetConnectionString("Billing")));
 builder.Services.AddScoped<IBillingStore>(sp => sp.GetRequiredService<BillingDbContext>());
