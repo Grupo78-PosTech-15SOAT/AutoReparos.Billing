@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="AutoReparos.Billing.Api/AutoReparos.Billing.Api.csproj" />
+  <Project Path="AutoReparos.Billing.Application/AutoReparos.Billing.Application.csproj" />
+  <Project Path="AutoReparos.Billing.Domain/AutoReparos.Billing.Domain.csproj" />
+  <Project Path="AutoReparos.Billing.Infrastructure/AutoReparos.Billing.Infrastructure.csproj" />
+  <Project Path="AutoReparos.Billing.Tests/AutoReparos.Billing.Tests.csproj" />
+</Solution>

@@ -1,0 +1,222 @@
+using AutoReparos.Billing.Application;
+using AutoReparos.Billing.Domain;
+using AutoReparos.Billing.Infrastructure;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using System.Security.Cryptography;
+using System.Text;
+using System.Net;
+using System.Net.Http.Json;
+using System.Security.Claims;
+using System.Text.Encodings.Web;
+
+namespace AutoReparos.Billing.Tests;
+
+public sealed class BillingLifecycleTests
+{
+    private sealed class Store : IBillingStore
+    {
+        public readonly List<Orcamento> Items = [];
+        public Task<Orcamento?> ObterOrcamentoAsync(Guid id, CancellationToken ct) => Task.FromResult(Items.SingleOrDefault(x => x.Id == id));
+        public Task<Pagamento?> ObterPagamentoAsync(Guid id, CancellationToken ct) => Task.FromResult(Items.Select(x => x.Pagamento).SingleOrDefault(x => x?.Id == id));
+        public Task<Orcamento?> ObterPorOrdemAsync(Guid id, CancellationToken ct) => Task.FromResult(Items.SingleOrDefault(x => x.OrdemServicoId == id));
+        public Task<Orcamento?> ObterPorPagamentoAsync(Guid id, CancellationToken ct) => Task.FromResult(Items.SingleOrDefault(x => x.Pagamento?.Id == id));
+        public Task AdicionarOrcamentoAsync(Orcamento orcamento, CancellationToken ct) { Items.Add(orcamento); return Task.CompletedTask; }
+        public Task SalvarAsync(CancellationToken ct) => Task.CompletedTask;
+    }
+    private sealed class Provider : ICheckoutProvider
+    {
+        public int Checkouts { get; private set; }
+        public (Guid PagamentoId, StatusPagamento Status, string Referencia)? WebhookResult { get; set; }
+        public Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, CancellationToken ct) { Checkouts++; return Task.FromResult(new AbrirCheckout("https://checkout.example/1", pagamentoId.ToString())); }
+        public Task<string> ReembolsarAsync(string referencia, decimal valor, string idempotencyKey, CancellationToken ct) => Task.FromResult("refund-123");
+        public Task<(Guid PagamentoId, StatusPagamento Status, string Referencia)?> ConsultarPagamentoAsync(string id, CancellationToken ct) => Task.FromResult(WebhookResult);
+    }
+    private sealed class Publisher(int failAttempts = 0) : IResultadoPublisher
+    {
+        public readonly List<EventoPagamento> Events = [];
+        public int Attempts { get; private set; }
+        public Task PublicarAsync(EventoPagamento evento, CancellationToken ct) { if (Attempts++ < failAttempts) throw new InvalidOperationException("SQS indisponível"); Events.Add(evento); return Task.CompletedTask; }
+    }
+    private sealed class Alerts : IAlertSink { public int Count { get; private set; } public Task AlertarAsync(string codigo, string detalhe, CancellationToken ct) { Count++; return Task.CompletedTask; } }
+    private sealed class Readiness(bool completed) : IOrderReadiness { public Task<bool> ServicoConcluidoAsync(Guid id, CancellationToken ct) => Task.FromResult(completed); }
+    private static (BillingService Service, Store Store, Provider Provider, Publisher Publisher) Setup(bool completed = true)
+    {
+        var store = new Store(); var provider = new Provider(); var publisher = new Publisher();
+        return (new BillingService(store, provider, publisher, new Alerts(), new Readiness(completed)), store, provider, publisher);
+    }
+    private static async Task<Pagamento> EligiblePayment(BillingService service)
+    {
+        var budget = await service.CriarOrcamentoAsync(new(Guid.NewGuid(), Guid.NewGuid(), 250m), CancellationToken.None);
+        budget.Aprovar(); return budget.Pagamento!;
+    }
+    private static HttpClient Authorized(HttpClient client, string role = "Administrador")
+    { client.DefaultRequestHeaders.Add("X-Test-Role", role); return client; }
+
+    [Fact]
+    public async Task CreatesBudgetForOrder()
+    {
+        var store = new Store(); var provider = new Provider(); var publisher = new Publisher(); var alerts = new Alerts();
+        using var factory = new BillingApiFactory(store, provider, publisher, alerts, new Readiness(true));
+        using var client = factory.CreateClient(); var request = new { ordemServicoId = Guid.NewGuid(), clienteId = Guid.NewGuid(), valor = 250m };
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.PostAsJsonAsync("/api/v1/orcamentos", request)).StatusCode);
+        client.DefaultRequestHeaders.Add("X-Test-Role", "Cliente");
+        Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsJsonAsync("/api/v1/orcamentos", request)).StatusCode);
+        client.DefaultRequestHeaders.Remove("X-Test-Role"); client.DefaultRequestHeaders.Add("X-Test-Role", "ServicoOS");
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, (await client.PostAsJsonAsync("/api/v1/orcamentos", new { request.ordemServicoId, request.clienteId, valor = 0m })).StatusCode);
+        var response = await client.PostAsJsonAsync("/api/v1/orcamentos", request);
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode); Assert.Single(store.Items); Assert.Equal(StatusOrcamento.Pendente, store.Items[0].Status);
+    }
+
+    [Fact]
+    public async Task ChargeRequiresApprovalAndCompletion()
+    {
+        var store = new Store(); var provider = new Provider(); var budget = new Orcamento(Guid.NewGuid(), Guid.NewGuid(), 250m, DateTimeOffset.UtcNow);
+        var payment = new Pagamento(budget.Id, budget.Valor); budget.DefinirPagamento(payment); store.Items.Add(budget);
+        using var factory = new BillingApiFactory(store, provider, new Publisher(), new Alerts(), new Readiness(false));
+        using var client = Authorized(factory.CreateClient());
+        Assert.Equal(HttpStatusCode.Conflict, (await client.PostAsync($"/api/v1/pagamentos/{payment.Id}/checkout", null)).StatusCode);
+        budget.Aprovar();
+        Assert.Equal(HttpStatusCode.Conflict, (await client.PostAsync($"/api/v1/pagamentos/{payment.Id}/checkout", null)).StatusCode);
+        Assert.Equal(0, provider.Checkouts);
+    }
+
+    [Fact]
+    public async Task CreatesSingleCheckoutAttempt()
+    {
+        var store = new Store(); var provider = new Provider(); var budget = new Orcamento(Guid.NewGuid(), Guid.NewGuid(), 250m, DateTimeOffset.UtcNow); budget.Aprovar(); store.Items.Add(budget);
+        var payment = budget.Pagamento!;
+        using var factory = new BillingApiFactory(store, provider, new Publisher(), new Alerts(), new Readiness(true));
+        using var client = Authorized(factory.CreateClient());
+        var first = await client.PostAsync($"/api/v1/pagamentos/{payment.Id}/checkout", null);
+        var second = await client.PostAsync($"/api/v1/pagamentos/{payment.Id}/checkout", null);
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode); Assert.Equal(HttpStatusCode.OK, second.StatusCode);
+        Assert.Equal(1, provider.Checkouts); Assert.Equal(StatusPagamento.Pendente, payment.Status);
+    }
+
+    [Fact]
+    public async Task WebhookSignatureValidation()
+    {
+        const string secret = "webhook-test-secret"; const string timestamp = "1712345678";
+        var manifest = "id:payment-1;request-id:request-1;ts:" + timestamp + ";";
+        var hash = Convert.ToHexStringLower(HMACSHA256.HashData(Encoding.UTF8.GetBytes(secret), Encoding.UTF8.GetBytes(manifest)));
+        var store = new Store(); var budget = new Orcamento(Guid.NewGuid(), Guid.NewGuid(), 250m, DateTimeOffset.UtcNow); budget.Aprovar(); store.Items.Add(budget);
+        var payment = budget.Pagamento!; payment.IniciarCheckout("https://checkout.example/1", "preference-1");
+        var provider = new Provider { WebhookResult = (payment.Id, StatusPagamento.Capturado, "mp-payment-1") };
+        var publisher = new Publisher(); using var factory = new BillingApiFactory(store, provider, publisher, new Alerts(), new Readiness(true));
+        using var client = factory.CreateClient();
+        using var valid = new HttpRequestMessage(HttpMethod.Post, "/api/v1/webhooks/mercado-pago")
+        { Content = JsonContent.Create(new { data = new { id = "payment-1" } }) };
+        valid.Headers.Add("x-signature", $"ts={timestamp},v1={hash}"); valid.Headers.Add("x-request-id", "request-1");
+        Assert.Equal(HttpStatusCode.Accepted, (await client.SendAsync(valid)).StatusCode);
+        Assert.Equal(StatusPagamento.Capturado, payment.Status); Assert.Single(publisher.Events);
+        using var duplicate = new HttpRequestMessage(HttpMethod.Post, "/api/v1/webhooks/mercado-pago")
+        { Content = JsonContent.Create(new { data = new { id = "payment-1" } }) };
+        duplicate.Headers.Add("x-signature", $"ts={timestamp},v1={hash}"); duplicate.Headers.Add("x-request-id", "request-1");
+        Assert.Equal(HttpStatusCode.Accepted, (await client.SendAsync(duplicate)).StatusCode); Assert.Single(publisher.Events);
+        using var invalid = new HttpRequestMessage(HttpMethod.Post, "/api/v1/webhooks/mercado-pago")
+        { Content = JsonContent.Create(new { data = new { id = "payment-1" } }) };
+        invalid.Headers.Add("x-signature", "ts=broken,v1=xyz"); invalid.Headers.Add("x-request-id", "request-1");
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.SendAsync(invalid)).StatusCode);
+    }
+
+    [Fact]
+    public async Task ManualRetryAfterTerminalState()
+    {
+        var store = new Store(); var provider = new Provider(); var budget = new Orcamento(Guid.NewGuid(), Guid.NewGuid(), 250m, DateTimeOffset.UtcNow); budget.Aprovar(); store.Items.Add(budget);
+        var payment = budget.Pagamento!;
+        using var factory = new BillingApiFactory(store, provider, new Publisher(), new Alerts(), new Readiness(true));
+        using var client = Authorized(factory.CreateClient());
+        Assert.Equal(HttpStatusCode.OK, (await client.PostAsync($"/api/v1/pagamentos/{payment.Id}/checkout", null)).StatusCode);
+        Assert.Equal(1, provider.Checkouts);
+        payment.AplicarEstado(StatusPagamento.Rejeitado, "provider-1");
+        client.DefaultRequestHeaders.Remove("X-Test-Role");
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.PostAsync($"/api/v1/pagamentos/{payment.Id}/checkout", null)).StatusCode);
+        client.DefaultRequestHeaders.Add("X-Test-Role", "Cliente");
+        Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsync($"/api/v1/pagamentos/{payment.Id}/checkout", null)).StatusCode);
+        client.DefaultRequestHeaders.Remove("X-Test-Role"); client.DefaultRequestHeaders.Add("X-Test-Role", "Atendente");
+        Assert.Equal(HttpStatusCode.OK, (await client.PostAsync($"/api/v1/pagamentos/{payment.Id}/checkout", null)).StatusCode);
+        Assert.Equal(2, provider.Checkouts);
+    }
+
+    [Fact]
+    public async Task CapturedPaymentForwardRecovery()
+    {
+        var store = new Store(); var provider = new Provider(); var publisher = new Publisher(failAttempts: 1); var alerts = new Alerts();
+        var service = new BillingService(store, provider, publisher, alerts, new Readiness(true));
+        var budget = await service.CriarOrcamentoAsync(new(Guid.NewGuid(), Guid.NewGuid(), 250m), CancellationToken.None); budget.Aprovar(); var payment = budget.Pagamento!;
+        await service.AbrirCheckoutAsync(payment.Id, CancellationToken.None);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.AplicarWebhookAsync(payment.Id, StatusPagamento.Capturado, "provider-1", CancellationToken.None));
+        await service.AplicarWebhookAsync(payment.Id, StatusPagamento.Capturado, "provider-1", CancellationToken.None);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.AbrirCheckoutAsync(payment.Id, CancellationToken.None));
+        Assert.Equal(StatusPagamento.Capturado, payment.Status); Assert.True(payment.ResultadoPublicado); Assert.Single(publisher.Events);
+        Assert.Equal(1, provider.Checkouts); Assert.Equal(1, alerts.Count); Assert.Empty(payment.Reembolsos);
+    }
+
+    [Fact]
+    public async Task ApprovedRefundAudit()
+    {
+        var store = new Store(); var provider = new Provider(); var budget = new Orcamento(Guid.NewGuid(), Guid.NewGuid(), 250m, DateTimeOffset.UtcNow); budget.Aprovar(); store.Items.Add(budget);
+        var payment = budget.Pagamento!; payment.IniciarCheckout("https://checkout.example/1", "preference-1"); payment.AplicarEstado(StatusPagamento.Capturado, "provider-1");
+        using var factory = new BillingApiFactory(store, provider, new Publisher(), new Alerts(), new Readiness(true));
+        using var client = Authorized(factory.CreateClient(), "Atendente");
+        var route = $"/api/v1/pagamentos/{payment.Id}/reembolsos"; var body = new { valor = 75m, referencia = "ticket-42" };
+        Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsJsonAsync(route, body)).StatusCode);
+        client.DefaultRequestHeaders.Remove("X-Test-Role"); client.DefaultRequestHeaders.Add("X-Test-Role", "Administrador");
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, (await client.PostAsJsonAsync(route, new { valor = 0m, referencia = "ticket-43" })).StatusCode);
+        var response = await client.PostAsJsonAsync(route, body); Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var result = await response.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>();
+        Assert.Equal(75m, result.GetProperty("valor").GetDecimal()); Assert.Equal("test-user", result.GetProperty("aprovador").GetString());
+        Assert.Equal("ticket-42", result.GetProperty("referencia").GetString());
+    }
+
+    [Fact]
+    public async Task DependencyRetryExhaustion()
+    {
+        var attempts = 0; var exhausted = 0;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => DependencyRetry.ExecuteAsync(
+            _ => { attempts++; return Task.FromException(new InvalidOperationException("transient")); },
+            _ => { exhausted++; return Task.CompletedTask; }, CancellationToken.None, 3, _ => TimeSpan.Zero));
+        Assert.Equal(3, attempts); Assert.Equal(1, exhausted);
+    }
+
+    private sealed class BillingApiFactory(Store store, Provider provider, Publisher publisher, Alerts alerts, Readiness readiness) : WebApplicationFactory<Program>
+    {
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.UseEnvironment("Testing");
+            builder.ConfigureAppConfiguration((_, config) => config.AddInMemoryCollection(new Dictionary<string, string?> { ["MercadoPago:WebhookSecret"] = "webhook-test-secret" }));
+            builder.ConfigureServices(services =>
+            {
+                services.RemoveAll<IBillingStore>(); services.AddSingleton<IBillingStore>(store);
+                services.RemoveAll<ICheckoutProvider>(); services.AddSingleton<ICheckoutProvider>(provider);
+                services.RemoveAll<IResultadoPublisher>(); services.AddSingleton<IResultadoPublisher>(publisher);
+                services.RemoveAll<IAlertSink>(); services.AddSingleton<IAlertSink>(alerts);
+                services.RemoveAll<IOrderReadiness>(); services.AddSingleton<IOrderReadiness>(readiness);
+                services.AddAuthentication(options =>
+                {
+                    options.DefaultAuthenticateScheme = "Test"; options.DefaultChallengeScheme = "Test"; options.DefaultScheme = "Test";
+                }).AddScheme<AuthenticationSchemeOptions, TestAuthHandler>("Test", _ => { });
+            });
+        }
+    }
+
+    private sealed class TestAuthHandler(IOptionsMonitor<AuthenticationSchemeOptions> options, ILoggerFactory logger, UrlEncoder encoder)
+        : AuthenticationHandler<AuthenticationSchemeOptions>(options, logger, encoder)
+    {
+        protected override Task<AuthenticateResult> HandleAuthenticateAsync()
+        {
+            var role = Request.Headers["X-Test-Role"].FirstOrDefault();
+            if (string.IsNullOrWhiteSpace(role)) return Task.FromResult(AuthenticateResult.NoResult());
+            var claims = new[] { new Claim(ClaimTypes.NameIdentifier, "test-user"), new Claim("sub", "test-user"), new Claim(ClaimTypes.Role, role) };
+            var identity = new ClaimsIdentity(claims, Scheme.Name, ClaimTypes.Name, ClaimTypes.Role);
+            return Task.FromResult(AuthenticateResult.Success(new AuthenticationTicket(new ClaimsPrincipal(identity), Scheme.Name)));
+        }
+    }
+}
