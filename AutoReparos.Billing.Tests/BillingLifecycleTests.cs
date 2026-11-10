@@ -39,6 +39,8 @@ public sealed partial class BillingLifecycleTests
         public Task<Orcamento?> ObterPorOrdemAsync(Guid id, CancellationToken ct) => Task.FromResult(Items.SingleOrDefault(x => x.OrdemServicoId == id));
         public Task<Orcamento?> ObterPorPagamentoAsync(Guid id, CancellationToken ct) => Task.FromResult(Items.SingleOrDefault(x => x.Pagamento?.Id == id));
         public Task AdicionarOrcamentoAsync(Orcamento orcamento, CancellationToken ct) { Items.Add(orcamento); return Task.CompletedTask; }
+        public readonly List<MensagemSaida> Mensagens = [];
+        public void AdicionarMensagemSaida(MensagemSaida mensagem) => Mensagens.Add(mensagem);
         public Task SalvarAsync(CancellationToken ct) => Task.CompletedTask;
     }
     private sealed class Provider : ICheckoutProvider
@@ -269,7 +271,7 @@ public sealed partial class BillingLifecycleTests
         var publisher = new SqsResultPublisher(sqs,
             new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?> { ["Sqs:QueueUrl"] = "main", ["Sqs:DeadLetterQueueUrl"] = "dlq" }).Build(),
             Microsoft.Extensions.Logging.Abstractions.NullLogger<SqsResultPublisher>.Instance, alerts);
-        await publisher.PublicarAsync(new EventoPagamento(Guid.NewGuid(), "Capturado", "provider-1"), CancellationToken.None);
+        await publisher.PublicarAsync(MensagensSaga.ResultadoPagamento(Guid.NewGuid(), Guid.NewGuid(), StatusPagamento.Capturado, "provider-1", DateTime.UtcNow), CancellationToken.None);
         Assert.Equal(5, sqs.MainAttempts); Assert.Equal(1, sqs.DeadLetterAttempts); Assert.Equal(1, alerts.Count);
     }
 

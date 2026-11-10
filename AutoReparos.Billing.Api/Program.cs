@@ -41,6 +41,16 @@ builder.Services.AddSingleton<IWebhookSignatureValidator, MercadoPagoSignatureVa
 builder.Services.AddSingleton<IAmazonSQS, AmazonSQSClient>();
 builder.Services.AddScoped<IAlertSink, LoggingAlertSink>();
 builder.Services.AddScoped<IResultadoPublisher, SqsResultPublisher>();
+builder.Services.AddScoped<IEventosProcessadosStore>(sp => sp.GetRequiredService<BillingDbContext>());
+builder.Services.AddScoped<CancelamentoOrcamentoService>();
+builder.Services.AddScoped<OutboxProcessor>();
+builder.Services.AddSingleton<ProcessadorComandos>();
+// Em testes (ambiente Testing) os serviços em segundo plano não sobem: cada teste os cria sobre o seu banco e o seu SQS falso.
+if (!builder.Environment.IsEnvironment("Testing"))
+{
+    builder.Services.AddHostedService<OutboxDispatcher>();
+    builder.Services.AddHostedService<ComandosConsumer>();
+}
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer(options =>
 {
     options.Authority = builder.Configuration["Authentication:Authority"];

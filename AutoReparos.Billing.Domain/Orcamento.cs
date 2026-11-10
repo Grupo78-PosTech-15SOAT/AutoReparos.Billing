@@ -18,6 +18,27 @@ public sealed class Orcamento
     public StatusOrcamento Status { get; private set; }
     public Pagamento? Pagamento { get; private set; }
     public void Aprovar() { if (Status != StatusOrcamento.Pendente) throw new InvalidOperationException("Orçamento não está pendente."); Status = StatusOrcamento.Aprovado; Pagamento ??= new Pagamento(Id, Valor); }
+    /// <summary>
+    /// O cancelamento só é possível enquanto não houve cobrança: orçamento Pendente, ou Aprovado cujo pagamento ainda está
+    /// SemTentativa (sem checkout iniciado e sem reembolso). Cancelar um orçamento já Cancelado é idempotente.
+    /// </summary>
+    public bool PodeCancelar(out string? motivoRecusa)
+    {
+        motivoRecusa = null;
+        if (Status == StatusOrcamento.Cancelado) return true;
+        if (Status == StatusOrcamento.Recusado) { motivoRecusa = "orcamento_recusado"; return false; }
+        if (Pagamento is { } p && (p.Status != StatusPagamento.SemTentativa || p.Tentativas > 0 || p.Reembolsos.Count > 0))
+        { motivoRecusa = "pagamento_existente"; return false; }
+        return true;
+    }
+    public void Cancelar()
+    {
+        if (!PodeCancelar(out var motivo)) throw new InvalidOperationException($"Cancelamento recusado: {motivo}.");
+        if (Status == StatusOrcamento.Cancelado) return;
+        Status = StatusOrcamento.Cancelado;
+        // Toca o pagamento para que um checkout concorrente (que altera a mesma linha) seja detectado pelo token xmin.
+        Pagamento?.RegistrarCancelamentoDoOrcamento();
+    }
     public Pagamento CriarPagamento(bool servicoConcluido)
     {
         if (Status != StatusOrcamento.Aprovado || !servicoConcluido) throw new InvalidOperationException("Cobrança exige orçamento aprovado e serviço concluído.");
@@ -26,4 +47,4 @@ public sealed class Orcamento
     public void DefinirPagamento(Pagamento pagamento) => Pagamento = pagamento;
 }
 
-public enum StatusOrcamento { Pendente, Aprovado, Recusado }
+public enum StatusOrcamento { Pendente, Aprovado, Recusado, Cancelado }

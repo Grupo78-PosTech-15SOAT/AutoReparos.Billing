@@ -4,7 +4,8 @@ namespace AutoReparos.Billing.Application;
 
 public sealed record CriarOrcamento(Guid OrdemServicoId, Guid ClienteId, decimal Valor);
 public sealed record AbrirCheckout(string Url, string Referencia);
-public sealed record EventoPagamento(Guid PagamentoId, string Status, string Referencia);
+// Contrato pagamento.resultado.v1 (envelope completo); a construção fica em MensagensSaga.ResultadoPagamento.
+public sealed record EventoPagamento(Guid EventId, string Tipo, Guid OrdemServicoId, DateTime OcorreuEm, Guid PagamentoId, string Status, string Referencia);
 public sealed record SolicitacaoReembolso(decimal Valor, string Referencia);
 
 public sealed class ConcorrenciaException(string mensagem, Exception? inner = null) : Exception(mensagem, inner);
@@ -25,6 +26,8 @@ public interface IBillingStore
     Task<Orcamento?> ObterPorOrdemAsync(Guid ordemId, CancellationToken ct);
     Task<Orcamento?> ObterPorPagamentoAsync(Guid pagamentoId, CancellationToken ct);
     Task AdicionarOrcamentoAsync(Orcamento orcamento, CancellationToken ct);
+    /// <summary>Registra uma mensagem de outbox na mesma unidade de trabalho do próximo <see cref="SalvarAsync"/>.</summary>
+    void AdicionarMensagemSaida(MensagemSaida mensagem);
     Task SalvarAsync(CancellationToken ct);
 }
 public interface ICheckoutProvider { Task<AbrirCheckout> CriarCheckoutAsync(Guid pagamentoId, decimal valor, string idempotencyKey, CancellationToken ct); Task<string> ReembolsarAsync(string referencia, decimal valor, string idempotencyKey, CancellationToken ct); Task<(Guid PagamentoId, StatusPagamento Status, string Referencia)?> ConsultarPagamentoAsync(string id, CancellationToken ct); }
@@ -46,7 +49,10 @@ public sealed class BillingService(IBillingStore store, ICheckoutProvider provid
     {
         var orcamento = await store.ObterOrcamentoAsync(id, ct) ?? throw new KeyNotFoundException();
         if (orcamento.ClienteId != clienteId) throw new UnauthorizedAccessException();
-        orcamento.Aprovar(); await store.SalvarAsync(ct); return orcamento;
+        orcamento.Aprovar();
+        // Outbox: o evento da Saga é gravado na mesma transação da aprovação; o despachador publica depois, sem afetar o HTTP.
+        store.AdicionarMensagemSaida(MensagensSaga.OrcamentoAprovado(orcamento, DateTime.UtcNow));
+        await store.SalvarAsync(ct); return orcamento;
     }
     public async Task<Pagamento> AbrirCheckoutAsync(Guid pagamentoId, Guid? clienteId, CancellationToken ct)
     {
@@ -64,12 +70,13 @@ public sealed class BillingService(IBillingStore store, ICheckoutProvider provid
     {
         var pagamento = await store.ObterPagamentoAsync(pagamentoId, ct) ?? throw new KeyNotFoundException();
         if (pagamento.Status == status && pagamento.ReferenciaProvedor == referencia && pagamento.ResultadoPublicado) return;
+        var ordemServicoId = (await store.ObterPorPagamentoAsync(pagamentoId, ct) ?? throw new KeyNotFoundException()).OrdemServicoId;
         if (pagamento.Status != status || pagamento.ReferenciaProvedor != referencia)
         {
             if (!pagamento.AplicarEstado(status, referencia)) return;
             await store.SalvarAsync(ct);
         }
-        try { await publisher.PublicarAsync(new(pagamento.Id, status.ToString(), referencia), ct); pagamento.MarcarResultadoPublicado(); await store.SalvarAsync(ct); }
+        try { await publisher.PublicarAsync(MensagensSaga.ResultadoPagamento(ordemServicoId, pagamento.Id, status, referencia, DateTime.UtcNow), ct); pagamento.MarcarResultadoPublicado(); await store.SalvarAsync(ct); }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             await alerts.AlertarAsync("billing.payment_sync_failed", $"{pagamento.Id}: {ex.Message}", ct);

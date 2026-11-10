@@ -4,11 +4,13 @@ using Microsoft.EntityFrameworkCore;
 
 namespace AutoReparos.Billing.Infrastructure;
 
-public sealed class BillingDbContext(DbContextOptions<BillingDbContext> options) : DbContext(options), IBillingStore
+public sealed class BillingDbContext(DbContextOptions<BillingDbContext> options) : DbContext(options), IBillingStore, IEventosProcessadosStore
 {
     public DbSet<Orcamento> Orcamentos => Set<Orcamento>();
     public DbSet<Pagamento> Pagamentos => Set<Pagamento>();
     public DbSet<Reembolso> Reembolsos => Set<Reembolso>();
+    public DbSet<MensagemSaida> MensagensSaida => Set<MensagemSaida>();
+    public DbSet<EventoProcessado> EventosProcessados => Set<EventoProcessado>();
     protected override void OnModelCreating(ModelBuilder model)
     {
         model.Entity<Orcamento>().ToTable("orcamentos").HasKey(x => x.Id);
@@ -27,12 +29,20 @@ public sealed class BillingDbContext(DbContextOptions<BillingDbContext> options)
         model.Entity<Reembolso>().Property(x => x.Valor).HasPrecision(18, 2);
         model.Entity<Reembolso>().Property(x => x.Estado).HasConversion<int>();
         model.Entity<Reembolso>().HasIndex(x => new { x.PagamentoId, x.Referencia }).IsUnique();
+        model.Entity<MensagemSaida>().ToTable("mensagens_saida").HasKey(x => x.Id);
+        model.Entity<MensagemSaida>().Property(x => x.Id).ValueGeneratedNever();
+        model.Entity<MensagemSaida>().HasIndex(x => x.CriadoEm).HasFilter("\"EnviadoEm\" IS NULL AND \"EsgotadaEm\" IS NULL").HasDatabaseName("IX_mensagens_saida_pendentes");
+        model.Entity<EventoProcessado>().ToTable("eventos_processados").HasKey(x => x.Id);
+        model.Entity<EventoProcessado>().Property(x => x.Id).ValueGeneratedNever();
     }
     public Task<Orcamento?> ObterOrcamentoAsync(Guid id, CancellationToken ct) => Orcamentos.Include(x => x.Pagamento).ThenInclude(x => x!.Reembolsos).SingleOrDefaultAsync(x => x.Id == id, ct);
     public Task<Pagamento?> ObterPagamentoAsync(Guid id, CancellationToken ct) => Pagamentos.Include(x => x.Reembolsos).SingleOrDefaultAsync(x => x.Id == id, ct);
     public Task<Orcamento?> ObterPorOrdemAsync(Guid ordemId, CancellationToken ct) => Orcamentos.Include(x => x.Pagamento).SingleOrDefaultAsync(x => x.OrdemServicoId == ordemId, ct);
     public Task<Orcamento?> ObterPorPagamentoAsync(Guid pagamentoId, CancellationToken ct) => Orcamentos.Include(x => x.Pagamento).SingleOrDefaultAsync(x => x.Pagamento!.Id == pagamentoId, ct);
     public Task AdicionarOrcamentoAsync(Orcamento orcamento, CancellationToken ct) => Orcamentos.AddAsync(orcamento, ct).AsTask();
+    public void AdicionarMensagemSaida(MensagemSaida mensagem) => MensagensSaida.Add(mensagem);
+    public Task<bool> ExisteAsync(Guid eventId, CancellationToken ct) => EventosProcessados.AnyAsync(x => x.Id == eventId, ct);
+    public void Registrar(EventoProcessado evento) => EventosProcessados.Add(evento);
     public async Task SalvarAsync(CancellationToken ct)
     {
         try { await SaveChangesAsync(ct); }

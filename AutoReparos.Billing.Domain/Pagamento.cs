@@ -37,6 +37,7 @@ public sealed class Pagamento
         ResultadoPublicado = false; Revisao++;
         return true;
     }
+    public void RegistrarCancelamentoDoOrcamento() => Revisao++;
     public void MarcarResultadoPublicado() { ResultadoPublicado = true; Revisao++; }
     public void DesfazerReembolso(Reembolso reembolso)
     {

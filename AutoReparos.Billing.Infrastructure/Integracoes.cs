@@ -130,36 +130,13 @@ public sealed class MercadoPagoSignatureValidator(IConfiguration config) : IWebh
     }
 }
 
-public sealed class SqsResultPublisher(IAmazonSQS sqs, IConfiguration config, ILogger<SqsResultPublisher> logger, IAlertSink alerts) : IResultadoPublisher
+public sealed class SqsResultPublisher(IAmazonSQS sqs, IConfiguration config, ILogger<SqsResultPublisher> logger, IAlertSink alerts, Func<int, TimeSpan>? delay = null) : IResultadoPublisher
 {
     public async Task PublicarAsync(EventoPagamento evento, CancellationToken ct)
     {
         var main = config["Sqs:QueueUrl"] ?? throw new InvalidOperationException("SQS principal não configurada.");
         var dlq = config["Sqs:DeadLetterQueueUrl"] ?? throw new InvalidOperationException("SQS DLQ não configurada.");
-        var payload = JsonSerializer.Serialize(evento);
-        for (var attempt = 1; attempt <= 5; attempt++)
-        {
-            try { await sqs.SendMessageAsync(main, payload, ct); return; }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                if (attempt == 5)
-                {
-                    try
-                    {
-                        await sqs.SendMessageAsync(dlq, payload, ct);
-                        await alerts.AlertarAsync("billing.sqs.exhausted", evento.PagamentoId.ToString(), ct);
-                        return;
-                    }
-                    catch (Exception dlqError) when (dlqError is not OperationCanceledException)
-                    {
-                        logger.LogError(dlqError, "Falha ao encaminhar evento Billing à DLQ");
-                        await alerts.AlertarAsync("billing.sqs.dlq_failed", evento.PagamentoId.ToString(), ct);
-                        throw;
-                    }
-                }
-                await Task.Delay(RetryDelayPolicy.Calculate(attempt, Random.Shared.Next(0, 100)), ct);
-            }
-        }
+        await SqsEnvio.EnviarAsync(sqs, alerts, logger, main, dlq, JsonSerializer.Serialize(evento, MensagensSaga.Json), evento.PagamentoId.ToString(), ct, delay);
     }
 }
 
