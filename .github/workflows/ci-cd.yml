@@ -1,0 +1,92 @@
+name: CI/CD - AutoReparos.Cobranca
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOLUTION: AutoReparos.Cobranca.slnx
+  MINIMO_COBERTURA: 80
+  DOTNET_NOLOGO: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet restore "$SOLUTION"
+      - run: dotnet build "$SOLUTION" --no-restore -m:1 -c Release
+      - run: dotnet format "$SOLUTION" --verify-no-changes --no-restore
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet restore "$SOLUTION"
+      - run: dotnet build "$SOLUTION" --no-restore -m:1 -c Release
+      - name: Testes de AutoReparos.Cobranca.Tests
+        run: >-
+          dotnet test AutoReparos.Cobranca.Tests --no-build --no-restore -m:1 -c Release
+          --results-directory TestResults/AutoReparos.Cobranca.Tests --logger trx
+          --collect:"XPlat Code Coverage"
+          -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura,opencover
+          DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.ExcludeByFile=**/Migrations/*.cs
+      - name: Verificar cobertura mínima de linhas
+        run: python3 .github/scripts/verificar_cobertura.py TestResults --minimo "$MINIMO_COBERTURA"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: resultados-testes
+          path: TestResults
+          retention-days: 7
+
+  quality:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION || 'grupo78-postech-15soat' }}
+      SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY || 'Grupo78-PosTech-15SOAT_AutoReparos.Cobranca' }}
+    steps:
+      - name: Exigir SONAR_TOKEN
+        run: |
+          if [ -z "$SONAR_TOKEN" ]; then
+            echo "::error::Segredo SONAR_TOKEN ausente: o quality gate do SonarCloud é obrigatório"
+            exit 1
+          fi
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: 10.0.x
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: resultados-testes
+          path: TestResults
+      - run: dotnet tool install --global dotnet-sonarscanner
+      - name: SonarCloud com quality gate
+        run: |
+          dotnet sonarscanner begin             /k:"$SONAR_PROJECT_KEY" /o:"$SONAR_ORGANIZATION"             /d:sonar.token="$SONAR_TOKEN"             /d:sonar.host.url=https://sonarcloud.io             /d:sonar.qualitygate.wait=true             /d:sonar.cs.opencover.reportsPaths="TestResults/**/coverage.opencover.xml"             /d:sonar.cs.vstest.reportsPaths="TestResults/**/*.trx"             /d:sonar.exclusions="**/bin/**,**/obj/**,**/Migrations/**"
+          dotnet build "$SOLUTION" -m:1 -c Release
+          dotnet sonarscanner end /d:sonar.token="$SONAR_TOKEN"
