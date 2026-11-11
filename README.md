@@ -1,6 +1,6 @@
-# AutoReparos Billing
+# AutoReparos Cobrança
 
-Billing is the isolated service for OS budgets, customer approval, Mercado Pago Checkout Pro, payment notifications, and authorized refunds. It owns its PostgreSQL schema and does not read the OS database.
+Cobrança is the isolated service for OS budgets, customer approval, Mercado Pago Checkout Pro, payment notifications, and authorized refunds. It owns its PostgreSQL schema and does not read the OS database.
 
 ## Configuration
 
@@ -8,7 +8,7 @@ Set these values through environment variables or a secret manager:
 
 | Setting | Purpose |
 | --- | --- |
-| `ConnectionStrings__Billing` | Billing PostgreSQL database connection |
+| `ConnectionStrings__Billing` | Cobrança PostgreSQL database connection |
 | `Authentication__Authority` / `Authentication__Audience` | JWT issuer and audience |
 | `MercadoPago__AccessToken` | Mercado Pago private access token |
 | `MercadoPago__WebhookSecret` | Webhook signature secret |
@@ -16,10 +16,10 @@ Set these values through environment variables or a secret manager:
 | `OsService__BearerToken` | Service identity token authorized to query the OS API |
 | `AWS_REGION` | AWS region for SQS |
 | `Sqs__QueueUrl` / `Sqs__DeadLetterQueueUrl` | Entry queue of the OS Saga (result and budget events) and its dead-letter queue |
-| `Sqs__ComandosQueueUrl` / `Sqs__ComandosDeadLetterQueueUrl` | Command queue consumed by Billing (`cobranca.cancelar-orcamento.v1`, plus legacy alias `billing.orcamento.cancelar.v1`) and its dead-letter queue |
+| `Sqs__ComandosQueueUrl` / `Sqs__ComandosDeadLetterQueueUrl` | Command queue consumed by Cobrança (`cobranca.cancelar-orcamento.v1`, plus legacy alias `billing.orcamento.cancelar.v1`) and its dead-letter queue |
 | `Outbox__IntervaloMs` | Optional: polling interval of the outbox dispatcher in milliseconds (default 2000) |
 
-The service applies EF Core migrations at startup. The Billing database and role must be provisioned separately with no access to OS tables. Never commit tokens or connection strings.
+The service applies EF Core migrations at startup. The Cobrança database and role must be provisioned separately with no access to OS tables. Never commit tokens or connection strings.
 
 ## Routes
 
@@ -32,15 +32,15 @@ The service applies EF Core migrations at startup. The Billing database and role
 Build and verify locally from this directory:
 
 ```sh
-dotnet restore AutoReparos.Billing.slnx
-dotnet build AutoReparos.Billing.slnx -m:1
-dotnet test AutoReparos.Billing.Tests --no-build
-dotnet format AutoReparos.Billing.slnx --verify-no-changes --no-restore
+dotnet restore AutoReparos.Cobranca.slnx
+dotnet build AutoReparos.Cobranca.slnx -m:1
+dotnet test AutoReparos.Cobranca.Tests --no-build
+dotnet format AutoReparos.Cobranca.slnx --verify-no-changes --no-restore
 ```
 
 ## Contrato de mensagens da Saga (v1)
 
-O Billing participa da Saga orquestrada pelo OS Service apenas por mensagens SQS (JSON, chaves em camelCase). O contrato completo está em `.specs/features/fase4/saga-mensageria/contracts.md` do repositório principal; aqui fica o que o Billing publica e consome. Todo envelope tem `eventId`, `tipo`, `ordemServicoId` e `ocorreuEm` (UTC, ISO 8601); `correlacaoId` só aparece quando o Billing o conhece (nas respostas ao comando de cancelamento, ecoado do comando).
+O Cobrança participa da Saga orquestrada pelo OS Service apenas por mensagens SQS (JSON, chaves em camelCase). O contrato completo está em `.specs/features/fase4/saga-mensageria/contracts.md` do repositório principal; aqui fica o que o Cobrança publica e consome. Todo envelope tem `eventId`, `tipo`, `ordemServicoId` e `ocorreuEm` (UTC, ISO 8601); `correlacaoId` só aparece quando o Cobrança o conhece (nas respostas ao comando de cancelamento, ecoado do comando).
 
 ### Saída (fila de entrada da Saga, `Sqs__QueueUrl`)
 

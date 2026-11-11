@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="AutoReparos.Cobranca.Api/AutoReparos.Cobranca.Api.csproj" />
+  <Project Path="AutoReparos.Cobranca.Application/AutoReparos.Cobranca.Application.csproj" />
+  <Project Path="AutoReparos.Cobranca.Domain/AutoReparos.Cobranca.Domain.csproj" />
+  <Project Path="AutoReparos.Cobranca.Infrastructure/AutoReparos.Cobranca.Infrastructure.csproj" />
+  <Project Path="AutoReparos.Cobranca.Tests/AutoReparos.Cobranca.Tests.csproj" />
+</Solution>
