@@ -13,7 +13,11 @@ public static class TiposMensagem
     public const string PagamentoResultado = "pagamento.resultado.v1";
     public const string OrcamentoCancelado = "orcamento.cancelado.v1";
     public const string OrcamentoCancelamentoRecusado = "orcamento.cancelamento-recusado.v1";
-    public const string CancelarOrcamento = "billing.orcamento.cancelar.v1";
+    public const string CancelarOrcamento = "cobranca.cancelar-orcamento.v1";
+    public const string CancelarOrcamentoLegado = "billing.orcamento.cancelar.v1";
+
+    public static bool EhCancelamentoOrcamento(string? tipo) =>
+        tipo is CancelarOrcamento or CancelarOrcamentoLegado;
 }
 
 // Envelopes de saída. A ordem das propriedades é a ordem do JSON; correlacaoId é omitido quando ausente.
@@ -103,7 +107,8 @@ public sealed class CancelamentoOrcamentoService(IBillingStore store, IEventosPr
         if (await processados.ExisteAsync(chave, ct)) return DesfechoComando.Duplicado;
 
         string? motivoRecusa = null, alerta = null; Orcamento? orcamento = null;
-        if (comando.Tipo != TiposMensagem.CancelarOrcamento) { motivoRecusa = "tipo_desconhecido"; alerta = "billing.comando.tipo_desconhecido"; }
+        var tipoCancelamento = TiposMensagem.EhCancelamentoOrcamento(comando.Tipo);
+        if (!tipoCancelamento) { motivoRecusa = "tipo_desconhecido"; alerta = "billing.comando.tipo_desconhecido"; }
         else if (comando.EventId is null) { motivoRecusa = "mensagem_malformada"; alerta = "billing.comando.malformado"; }
         else
         {
@@ -121,7 +126,7 @@ public sealed class CancelamentoOrcamentoService(IBillingStore store, IEventosPr
         }
         else
             store.AdicionarMensagemSaida(MensagensSaga.CancelamentoRecusado(MensagensSaga.IdDeterministico($"{chave}:{TiposMensagem.OrcamentoCancelamentoRecusado}"), comando.CorrelacaoId, ordemServicoId, orcamentoId, motivoRecusa, agora));
-        processados.Registrar(new EventoProcessado(chave, comando.Tipo == TiposMensagem.CancelarOrcamento ? comando.Tipo : "desconhecido", agora));
+        processados.Registrar(new EventoProcessado(chave, tipoCancelamento ? comando.Tipo! : "desconhecido", agora));
         // Duplicata concorrente: a violação de chave única vira ConcorrenciaException e o reprocessamento encontra o eventId registrado.
         await store.SalvarAsync(ct);
         if (alerta is not null) await alerts.AlertarAsync(alerta, $"Comando {chave} recusado: {motivoRecusa} (orçamento {orcamentoId}).", ct);

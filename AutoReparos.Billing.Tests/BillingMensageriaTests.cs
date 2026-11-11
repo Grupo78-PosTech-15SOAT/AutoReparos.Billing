@@ -155,7 +155,7 @@ public sealed partial class BillingLifecycleTests
     private static Task<DesfechoComando> HandleCommandAsync(MensageriaFactory factory, string body) =>
         factory.Services.GetRequiredService<ProcessadorComandos>().ProcessarAsync(body, CancellationToken.None);
 
-    private static string CancelCommand(Guid eventId, Orcamento budget, Guid? correlacaoId = null, string tipo = "billing.orcamento.cancelar.v1") =>
+    private static string CancelCommand(Guid eventId, Orcamento budget, Guid? correlacaoId = null, string tipo = "cobranca.cancelar-orcamento.v1") =>
         JsonSerializer.Serialize(new Dictionary<string, object?>
         {
             ["eventId"] = eventId,
@@ -583,5 +583,107 @@ public sealed partial class BillingLifecycleTests
         await dispatcher.StopAsync(CancellationToken.None);
         Assert.Equal([a, b, c], sqs.Delivered("main").Select(body => Parse(body).GetProperty("eventId").GetGuid()).ToArray());
         Assert.All(await Outbox(factory), r => Assert.NotNull(r.EnviadoEm)); Assert.Empty(alerts.Codes);
+    }
+
+    // --- C4 a C6 de eventos-portugues: comando cobranca.cancelar-orcamento.v1, alias legado e tipo desconhecido
+
+    [Fact]
+    public async Task PortugueseCancellationAppliesAndRecordsInbox()
+    {
+        var (factory, postgres, _, _, sqs, alerts, provider, _) = await StartMensageriaAsync();
+        await using var _p = postgres; using var _f = factory;
+        var budget = await SeedBudget(factory, approved: true);
+        var eventId = Guid.NewGuid();
+        var correlacao = Guid.NewGuid();
+        var command = CancelCommand(eventId, budget, correlacao, tipo: "cobranca.cancelar-orcamento.v1");
+
+        Assert.Equal(DesfechoComando.Cancelado, await HandleCommandAsync(factory, command));
+
+        var persisted = await Db(factory, db => db.Orcamentos.AsNoTracking().Include(o => o.Pagamento).SingleAsync(o => o.Id == budget.Id));
+        Assert.Equal(StatusOrcamento.Cancelado, persisted.Status);
+        Assert.Equal(StatusPagamento.SemTentativa, persisted.Pagamento!.Status);
+
+        var inbox = Assert.Single(await Db(factory, db => db.EventosProcessados.AsNoTracking().ToListAsync()));
+        Assert.Equal(eventId, inbox.Id);
+        Assert.Equal("cobranca.cancelar-orcamento.v1", inbox.Tipo);
+
+        var row = Assert.Single(await Outbox(factory));
+        Assert.Equal("orcamento.cancelado.v1", row.Tipo);
+        var envelope = Parse(row.Payload);
+        Assert.Equal(["eventId", "tipo", "correlacaoId", "ordemServicoId", "ocorreuEm", "orcamentoId"], Names(envelope));
+        Assert.Equal("orcamento.cancelado.v1", envelope.GetProperty("tipo").GetString());
+        Assert.Equal(correlacao, envelope.GetProperty("correlacaoId").GetGuid());
+        Assert.Equal(budget.OrdemServicoId, envelope.GetProperty("ordemServicoId").GetGuid());
+        Assert.Equal(budget.Id, envelope.GetProperty("orcamentoId").GetGuid());
+        Assert.Empty(alerts.Codes);
+        Assert.Empty(sqs.Delivered("cmd-dlq"));
+        Assert.Equal(0, provider.RefundCalls);
+    }
+
+    [Fact]
+    public async Task LegacyAndPortugueseAliasesDeduplicateByEventId()
+    {
+        var (factory, postgres, _, _, sqs, alerts, provider, _) = await StartMensageriaAsync();
+        await using var _p = postgres; using var _f = factory;
+
+        // Caso 1: comando legado chega primeiro, comando em português com o mesmo eventId chega depois.
+        var budget1 = await SeedBudget(factory, approved: true);
+        var event1 = Guid.NewGuid();
+        var correlacao1 = Guid.NewGuid();
+        var legacyFirst = CancelCommand(event1, budget1, correlacao1, tipo: "billing.orcamento.cancelar.v1");
+        var portugueseSecond = CancelCommand(event1, budget1, correlacao1, tipo: "cobranca.cancelar-orcamento.v1");
+
+        Assert.Equal(DesfechoComando.Cancelado, await HandleCommandAsync(factory, legacyFirst));
+        Assert.Equal(DesfechoComando.Duplicado, await HandleCommandAsync(factory, portugueseSecond));
+
+        // Caso 2: comando em português chega primeiro, comando legado com o mesmo eventId chega depois.
+        var budget2 = await SeedBudget(factory, approved: true);
+        var event2 = Guid.NewGuid();
+        var correlacao2 = Guid.NewGuid();
+        var portugueseFirst = CancelCommand(event2, budget2, correlacao2, tipo: "cobranca.cancelar-orcamento.v1");
+        var legacySecond = CancelCommand(event2, budget2, correlacao2, tipo: "billing.orcamento.cancelar.v1");
+
+        Assert.Equal(DesfechoComando.Cancelado, await HandleCommandAsync(factory, portugueseFirst));
+        Assert.Equal(DesfechoComando.Duplicado, await HandleCommandAsync(factory, legacySecond));
+
+        var budgets = await Db(factory, async db => (await db.Orcamentos.AsNoTracking().ToListAsync()).ToDictionary(o => o.Id));
+        Assert.Equal(StatusOrcamento.Cancelado, budgets[budget1.Id].Status);
+        Assert.Equal(StatusOrcamento.Cancelado, budgets[budget2.Id].Status);
+
+        var inbox = await Db(factory, async db => (await db.EventosProcessados.AsNoTracking().ToListAsync()).ToDictionary(e => e.Id));
+        Assert.Equal(2, inbox.Count);
+        Assert.Equal("billing.orcamento.cancelar.v1", inbox[event1].Tipo);
+        Assert.Equal("cobranca.cancelar-orcamento.v1", inbox[event2].Tipo);
+
+        var rows = await Outbox(factory);
+        Assert.Equal(2, rows.Length);
+        Assert.Single(rows, r => Parse(r.Payload).GetProperty("orcamentoId").GetGuid() == budget1.Id);
+        Assert.Single(rows, r => Parse(r.Payload).GetProperty("orcamentoId").GetGuid() == budget2.Id);
+        Assert.Empty(alerts.Codes);
+        Assert.Empty(sqs.Delivered("cmd-dlq"));
+        Assert.Equal(0, provider.RefundCalls);
+    }
+
+    [Fact]
+    public async Task UnknownCancellationTypeGoesToDeadLetter()
+    {
+        var (factory, postgres, _, _, sqs, alerts, provider, _) = await StartMensageriaAsync();
+        await using var _p = postgres; using var _f = factory;
+        var budget = await SeedBudget(factory, approved: true);
+        var eventId = Guid.NewGuid();
+        var unknown = CancelCommand(eventId, budget, tipo: "billing.orcamento.apagar.v1");
+
+        Assert.Equal(DesfechoComando.Recusado, await HandleCommandAsync(factory, unknown));
+        var row = Assert.Single(await Outbox(factory));
+        Assert.Equal("orcamento.cancelamento-recusado.v1", row.Tipo);
+        Assert.Equal("tipo_desconhecido", Parse(row.Payload).GetProperty("motivo").GetString());
+        Assert.Equal(["billing.comando.tipo_desconhecido"], alerts.Codes);
+        Assert.Equal(StatusOrcamento.Aprovado, (await Db(factory, db => db.Orcamentos.AsNoTracking().SingleAsync(o => o.Id == budget.Id))).Status);
+        Assert.Equal(0, provider.RefundCalls);
+
+        var unknownWithoutIds = JsonSerializer.Serialize(new { eventId = Guid.NewGuid(), tipo = "billing.orcamento.apagar.v1" });
+        Assert.Equal(DesfechoComando.DeadLetter, await HandleCommandAsync(factory, unknownWithoutIds));
+        Assert.Equal([unknownWithoutIds], sqs.Delivered("cmd-dlq"));
+        Assert.Equal(["billing.comando.tipo_desconhecido", "billing.comando.malformado"], alerts.Codes);
     }
 }

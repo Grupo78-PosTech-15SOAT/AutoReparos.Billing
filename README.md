@@ -16,7 +16,7 @@ Set these values through environment variables or a secret manager:
 | `OsService__BearerToken` | Service identity token authorized to query the OS API |
 | `AWS_REGION` | AWS region for SQS |
 | `Sqs__QueueUrl` / `Sqs__DeadLetterQueueUrl` | Entry queue of the OS Saga (result and budget events) and its dead-letter queue |
-| `Sqs__ComandosQueueUrl` / `Sqs__ComandosDeadLetterQueueUrl` | Command queue consumed by Billing (`billing.orcamento.cancelar.v1`) and its dead-letter queue |
+| `Sqs__ComandosQueueUrl` / `Sqs__ComandosDeadLetterQueueUrl` | Command queue consumed by Billing (`cobranca.cancelar-orcamento.v1`, plus legacy alias `billing.orcamento.cancelar.v1`) and its dead-letter queue |
 | `Outbox__IntervaloMs` | Optional: polling interval of the outbox dispatcher in milliseconds (default 2000) |
 
 The service applies EF Core migrations at startup. The Billing database and role must be provisioned separately with no access to OS tables. Never commit tokens or connection strings.
@@ -59,7 +59,7 @@ O Billing participa da Saga orquestrada pelo OS Service apenas por mensagens SQS
 
 | `tipo` | Campos | Efeito |
 | --- | --- | --- |
-| `billing.orcamento.cancelar.v1` | `eventId`, `ordemServicoId`, `orcamentoId`, `motivo`, `correlacaoId` | cancela o orçamento se `Pendente`, ou `Aprovado` sem pagamento iniciado; novo estado `Cancelado` |
+| `cobranca.cancelar-orcamento.v1` (e alias legado de entrada `billing.orcamento.cancelar.v1`) | `eventId`, `ordemServicoId`, `orcamentoId`, `motivo`, `correlacaoId` | cancela o orçamento se `Pendente`, ou `Aprovado` sem pagamento iniciado; novo estado `Cancelado` |
 
 - **Deduplicação.** O `eventId` processado é registrado em `eventos_processados` na mesma transação do efeito e da resposta; uma entrega repetida (inclusive concorrente) não repete o efeito nem a resposta.
 - **Recusa.** Pagamento com checkout iniciado, capturado ou reembolsado, e orçamento `Recusado`, recusam com `motivo` `pagamento_existente` ou `orcamento_recusado`. Cancelar um orçamento já cancelado confirma de novo (idempotente). **Nenhum caminho de cancelamento chama estorno nem o provedor de pagamento.**
