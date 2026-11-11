@@ -46,7 +46,7 @@ jobs:
           --results-directory TestResults/AutoReparos.Cobranca.Tests --logger trx
           --collect:"XPlat Code Coverage"
           -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura,opencover
-          DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.ExcludeByFile=**/Migrations/*.cs
+          DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.ExcludeByFile="**/Migrations/*.cs,**/obj/**/*.cs"
       - name: Verificar cobertura mínima de linhas
         run: python3 .github/scripts/verificar_cobertura.py TestResults --minimo "$MINIMO_COBERTURA"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
