@@ -209,7 +209,7 @@ public sealed partial class BillingLifecycleTests
         Assert.Equal("orcamento.aprovado.v1", row.Tipo); Assert.Null(row.EnviadoEm); Assert.Null(row.EsgotadaEm); Assert.Equal(0, row.Tentativas);
 
         var envelope = Parse(row.Payload);
-        Assert.Equal(["eventId", "tipo", "ordemServicoId", "ocorreuEm", "orcamentoId", "clienteId"], Names(envelope));
+        Assert.Equal(["eventId", "tipo", "ordemServicoId", "ocorreuEm", "orcamentoId", "clienteId", "itens"], Names(envelope));
         Assert.Equal(row.Id, envelope.GetProperty("eventId").GetGuid());
         Assert.Equal("orcamento.aprovado.v1", envelope.GetProperty("tipo").GetString());
         Assert.Equal(budget.OrdemServicoId, envelope.GetProperty("ordemServicoId").GetGuid());
