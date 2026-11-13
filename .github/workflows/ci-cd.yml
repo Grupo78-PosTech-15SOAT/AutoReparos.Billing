@@ -17,6 +17,8 @@ env:
   SOLUTION: AutoReparos.Cobranca.slnx
   MINIMO_COBERTURA: 80
   DOTNET_NOLOGO: true
+  # O AmazonSQSClient do host de teste exige região; sem ela os testes de rota falham no runner (sem perfil AWS).
+  AWS_REGION: us-east-1
 
 jobs:
   build:
