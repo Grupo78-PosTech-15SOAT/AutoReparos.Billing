@@ -174,7 +174,7 @@ app.MapPost("/api/v1/admin/dlq/reprocessar", async (HttpContext http, Reprocessa
     }
     catch (System.Text.Json.JsonException) { return Results.UnprocessableEntity(new { codigo = "quantidade_invalida" }); }
     var autor = http.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value ?? http.User.FindFirst("sub")?.Value ?? "desconhecido";
-    return Results.Ok(await reprocessador.ReprocessarAsync(quantidade, autor, ct));
+    return Results.Accepted(value: await reprocessador.ReprocessarAsync(quantidade, autor, ct));
 }).RequireAuthorization("AdministrarDlq");
 app.Run();
 public partial class Program;

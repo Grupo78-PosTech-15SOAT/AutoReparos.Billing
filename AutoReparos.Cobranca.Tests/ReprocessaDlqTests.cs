@@ -94,10 +94,10 @@ public sealed class ReprocessaDlqTests
 
     private static Message Msg(string recibo) => new() { ReceiptHandle = recibo, Body = $"{{\"eventId\":\"{Guid.NewGuid()}\",\"recibo\":\"{recibo}\"}}" };
 
-    private static async Task<HttpResponseMessage> PostarAsync(Fabrica fabrica, string papel, string corpo)
+    private static async Task<HttpResponseMessage> PostarAsync(Fabrica fabrica, string? papel, string corpo)
     {
         using var cliente = fabrica.CreateClient();
-        cliente.DefaultRequestHeaders.Add("X-Test-Role", papel);
+        if (papel is not null) cliente.DefaultRequestHeaders.Add("X-Test-Role", papel);
         return await cliente.PostAsync("/api/v1/admin/dlq/reprocessar", new StringContent(corpo, Encoding.UTF8, "application/json"));
     }
 
@@ -111,7 +111,7 @@ public sealed class ReprocessaDlqTests
 
         var resposta = await PostarAsync(fabrica, "Administrador", "{\"quantidade\":4}");
 
-        Assert.Equal(HttpStatusCode.OK, resposta.StatusCode);
+        Assert.Equal(HttpStatusCode.Accepted, resposta.StatusCode);
         var corpo = await resposta.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal((4, 4), (corpo.GetProperty("solicitadas").GetInt32(), corpo.GetProperty("reprocessadas").GetInt32()));
         Assert.Equal([FilaComandos, FilaComandos, FilaEventos, FilaEventos], sqs.Enviadas.Select(e => e.Fila));
@@ -123,11 +123,12 @@ public sealed class ReprocessaDlqTests
     }
 
     [Theory]
+    [InlineData(null, "{\"quantidade\":1}", HttpStatusCode.Unauthorized)]
     [InlineData("Atendente", "{\"quantidade\":1}", HttpStatusCode.Forbidden)]
     [InlineData("Administrador", "{\"quantidade\":0}", HttpStatusCode.UnprocessableEntity)]
     [InlineData("Administrador", "{\"quantidade\":101}", HttpStatusCode.UnprocessableEntity)]
     [InlineData("Administrador", "{}", HttpStatusCode.UnprocessableEntity)]
-    public async Task ReprocessaDlqDaCobranca_RecusaPapelEQuantidadeInvalidos(string papel, string corpo, HttpStatusCode esperado)
+    public async Task ReprocessaDlqDaCobranca_RecusaPapelEQuantidadeInvalidos(string? papel, string corpo, HttpStatusCode esperado)
     {
         var sqs = new SqsFalso();
         sqs.Dlqs[DlqComandos].Enqueue(Msg("c1"));
