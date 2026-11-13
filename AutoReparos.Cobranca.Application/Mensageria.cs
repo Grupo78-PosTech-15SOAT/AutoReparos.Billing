@@ -21,7 +21,8 @@ public static class TiposMensagem
 }
 
 // Envelopes de saída. A ordem das propriedades é a ordem do JSON; correlacaoId é omitido quando ausente.
-public sealed record EnvelopeOrcamentoAprovado(Guid EventId, string Tipo, Guid OrdemServicoId, DateTime OcorreuEm, Guid OrcamentoId, Guid ClienteId);
+public sealed record ItemReservaEnvelope(Guid InsumoId, int Quantidade);
+public sealed record EnvelopeOrcamentoAprovado(Guid EventId, string Tipo, Guid OrdemServicoId, DateTime OcorreuEm, Guid OrcamentoId, Guid ClienteId, IReadOnlyList<ItemReservaEnvelope> Itens);
 public sealed record EnvelopeOrcamentoCancelado(Guid EventId, string Tipo, Guid? CorrelacaoId, Guid OrdemServicoId, DateTime OcorreuEm, Guid OrcamentoId);
 public sealed record EnvelopeCancelamentoRecusado(Guid EventId, string Tipo, Guid? CorrelacaoId, Guid OrdemServicoId, DateTime OcorreuEm, Guid OrcamentoId, string Motivo);
 
@@ -35,9 +36,13 @@ public static class MensagensSaga
     public static MensagemSaida OrcamentoAprovado(Orcamento orcamento, DateTime ocorreuEmUtc)
     {
         var id = IdDeterministico($"{TiposMensagem.OrcamentoAprovado}:{orcamento.Id}");
-        var envelope = new EnvelopeOrcamentoAprovado(id, TiposMensagem.OrcamentoAprovado, orcamento.OrdemServicoId, ocorreuEmUtc, orcamento.Id, orcamento.ClienteId);
+        var envelope = new EnvelopeOrcamentoAprovado(id, TiposMensagem.OrcamentoAprovado, orcamento.OrdemServicoId, ocorreuEmUtc, orcamento.Id, orcamento.ClienteId, ItensParaReserva(orcamento));
         return new MensagemSaida(id, envelope.Tipo, JsonSerializer.Serialize(envelope, Json), ocorreuEmUtc);
     }
+
+    // Só os insumos do orçamento aprovado entram na reserva (D-32); serviços não têm saldo. Lista vazia quando o orçamento não tem insumos.
+    private static IReadOnlyList<ItemReservaEnvelope> ItensParaReserva(Orcamento orcamento) =>
+        [.. orcamento.Itens.Where(i => i.Tipo == TipoItemOrcamento.Insumo).GroupBy(i => i.ReferenciaId).Select(g => new ItemReservaEnvelope(g.Key, g.Sum(i => i.Quantidade)))];
 
     public static MensagemSaida OrcamentoCancelado(Guid eventId, Guid? correlacaoId, Guid ordemServicoId, Guid orcamentoId, DateTime ocorreuEmUtc)
     {
