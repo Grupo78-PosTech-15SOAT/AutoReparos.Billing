@@ -38,6 +38,10 @@ public sealed partial class BillingLifecycleTests
         public Task<Pagamento?> ObterPagamentoAsync(Guid id, CancellationToken ct) => Task.FromResult(Items.Select(x => x.Pagamento).SingleOrDefault(x => x?.Id == id));
         public Task<Orcamento?> ObterPorOrdemAsync(Guid id, CancellationToken ct) => Task.FromResult(Items.SingleOrDefault(x => x.OrdemServicoId == id));
         public Task<Orcamento?> ObterPorPagamentoAsync(Guid id, CancellationToken ct) => Task.FromResult(Items.SingleOrDefault(x => x.Pagamento?.Id == id));
+        public readonly List<TokenAprovacao> Tokens = [];
+        public Task<TokenAprovacao?> ObterTokenPorHashAsync(string hash, CancellationToken ct) => Task.FromResult(Tokens.SingleOrDefault(x => x.Hash == hash));
+        public Task<TokenAprovacao?> ObterTokenDoOrcamentoAsync(Guid orcamentoId, CancellationToken ct) => Task.FromResult(Tokens.SingleOrDefault(x => x.OrcamentoId == orcamentoId));
+        public void AdicionarToken(TokenAprovacao token) => Tokens.Add(token);
         public Task AdicionarOrcamentoAsync(Orcamento orcamento, CancellationToken ct) { Items.Add(orcamento); return Task.CompletedTask; }
         public readonly List<MensagemSaida> Mensagens = [];
         public void AdicionarMensagemSaida(MensagemSaida mensagem) => Mensagens.Add(mensagem);

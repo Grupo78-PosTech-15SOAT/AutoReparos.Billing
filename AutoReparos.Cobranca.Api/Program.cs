@@ -62,6 +62,7 @@ builder.Services.AddAuthorization(options =>
 {
     options.AddPolicy("ServicoOS", p => p.RequireRole("ServicoOS"));
     options.AddPolicy("OperarBilling", p => p.RequireRole("Administrador", "Atendente", "ServicoOS"));
+    options.AddPolicy("ConsultarWeb", p => p.RequireRole("Administrador", "Atendente"));
     options.AddPolicy("AprovarReembolso", p => p.RequireRole("Administrador"));
     options.AddPolicy("AdministrarDlq", p => p.RequireRole("Administrador"));
     options.AddPolicy("AprovarOrcamento", p => p.RequireRole("Cliente"));
@@ -110,6 +111,50 @@ orcamentos.MapPost("", async (CriarOrcamento request, BillingService service, Ca
         itens = result.Itens.Select(i => new { tipo = i.Tipo.ToString(), i.ReferenciaId, i.Descricao, i.Quantidade, i.PrecoUnitario, i.Subtotal })
     });
 });
+app.MapGet("/api/v1/orcamentos", async (string? ordemServicoId, IBillingStore store, CancellationToken ct) =>
+{
+    if (!Guid.TryParse(ordemServicoId, out var ordemId) || ordemId == Guid.Empty) return Results.UnprocessableEntity(new { codigo = "ordem_servico_invalida" });
+    var o = await store.ObterPorOrdemAsync(ordemId, ct);
+    return o is null ? Results.NotFound() : Results.Ok(new
+    {
+        o.Id,
+        o.OrdemServicoId,
+        o.ClienteId,
+        o.Valor,
+        status = o.Status.ToString(),
+        pagamentoId = o.Pagamento?.Id,
+        itens = o.Itens.Select(i => new { tipo = i.Tipo.ToString(), i.ReferenciaId, i.Descricao, i.Quantidade, i.PrecoUnitario, i.Subtotal })
+    });
+}).RequireAuthorization("ConsultarWeb");
+app.MapPost("/api/v1/orcamentos/{id:guid}/link-aprovacao", async (Guid id, BillingService service, CancellationToken ct) =>
+{
+    try { var link = await service.GerarLinkAprovacaoAsync(id, ct); return Results.Json(new { token = link.Token, link.ExpiraEm }, statusCode: StatusCodes.Status201Created); }
+    catch (KeyNotFoundException) { return Results.NotFound(); }
+    catch (InvalidOperationException) { return Results.Conflict(new { codigo = "orcamento_nao_pendente" }); }
+}).RequireAuthorization("ConsultarWeb");
+// Rotas públicas do link de aprovação: o token é a única credencial e nunca vai ao log nem a resposta de erro.
+app.MapGet("/api/v1/orcamentos/publico", async (string? token, BillingService service, CancellationToken ct) =>
+{
+    try
+    {
+        var o = await service.ObterOrcamentoPorTokenAsync(token, ct);
+        return Results.Ok(new { o.Valor, status = o.Status.ToString(), itens = o.Itens.Select(i => new { tipo = i.Tipo.ToString(), i.Descricao, i.Quantidade, i.PrecoUnitario, i.Subtotal }) });
+    }
+    catch (TokenInvalidoException) { return Results.NotFound(new { codigo = "token_invalido" }); }
+}).AllowAnonymous();
+app.MapPost("/api/v1/orcamentos/publico/aprovacao", async (HttpRequest http, BillingService service, CancellationToken ct) =>
+{
+    string? token = null;
+    try
+    {
+        using var corpo = await System.Text.Json.JsonDocument.ParseAsync(http.Body, cancellationToken: ct);
+        if (corpo.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object && corpo.RootElement.TryGetProperty("token", out var t) && t.ValueKind == System.Text.Json.JsonValueKind.String) token = t.GetString();
+    }
+    catch (System.Text.Json.JsonException) { }
+    try { var o = await service.AprovarPorTokenAsync(token, ct); return Results.Ok(new { status = o.Status.ToString() }); }
+    catch (TokenInvalidoException) { return Results.NotFound(new { codigo = "token_invalido" }); }
+    catch (Exception ex) when (ex is InvalidOperationException or ConcorrenciaException) { return Results.Conflict(new { codigo = "orcamento_nao_pendente" }); }
+}).AllowAnonymous();
 app.MapPost("/api/v1/orcamentos/{id:guid}/aprovacao", async (Guid id, HttpContext context, BillingService service, CancellationToken ct) =>
 {
     if (!Guid.TryParse(context.User.FindFirst("clienteId")?.Value, out var clienteId)) return Results.Forbid();
@@ -120,6 +165,11 @@ app.MapPost("/api/v1/orcamentos/{id:guid}/aprovacao", async (Guid id, HttpContex
 }).RequireAuthorization("AprovarOrcamento");
 
 var pagamentos = app.MapGroup("/api/v1/pagamentos");
+pagamentos.MapGet("/{id:guid}", async (Guid id, IBillingStore store, CancellationToken ct) =>
+{
+    var p = await store.ObterPagamentoAsync(id, ct);
+    return p is null ? Results.NotFound() : Results.Ok(new { p.Id, status = p.Status.ToString(), p.Valor, checkoutUrl = p.UrlCheckout });
+}).RequireAuthorization("ConsultarWeb");
 pagamentos.MapPost("/{id:guid}/checkout", async (Guid id, HttpContext context, BillingService service, CancellationToken ct) =>
 {
     Guid? clienteId = null;
@@ -178,3 +228,4 @@ app.MapPost("/api/v1/admin/dlq/reprocessar", async (HttpContext http, Reprocessa
 }).RequireAuthorization("AdministrarDlq");
 app.Run();
 public partial class Program;
+

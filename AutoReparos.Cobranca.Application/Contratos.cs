@@ -44,12 +44,19 @@ public sealed class DependenciaIndisponivelException(string dependencia, Excepti
     public string Dependencia { get; } = dependencia;
 }
 
+public sealed record LinkAprovacao(string Token, DateTimeOffset ExpiraEm);
+/// <summary>Token de aprovação desconhecido, malformado, expirado (ou já usado, no resumo); as causas são indistinguíveis de propósito.</summary>
+public sealed class TokenInvalidoException : Exception;
+
 public interface IBillingStore
 {
     Task<Orcamento?> ObterOrcamentoAsync(Guid id, CancellationToken ct);
     Task<Pagamento?> ObterPagamentoAsync(Guid id, CancellationToken ct);
     Task<Orcamento?> ObterPorOrdemAsync(Guid ordemId, CancellationToken ct);
     Task<Orcamento?> ObterPorPagamentoAsync(Guid pagamentoId, CancellationToken ct);
+    Task<TokenAprovacao?> ObterTokenPorHashAsync(string hash, CancellationToken ct);
+    Task<TokenAprovacao?> ObterTokenDoOrcamentoAsync(Guid orcamentoId, CancellationToken ct);
+    void AdicionarToken(TokenAprovacao token);
     Task AdicionarOrcamentoAsync(Orcamento orcamento, CancellationToken ct);
     /// <summary>Registra uma mensagem de outbox na mesma unidade de trabalho do próximo <see cref="SalvarAsync"/>.</summary>
     void AdicionarMensagemSaida(MensagemSaida mensagem);
@@ -81,10 +88,49 @@ public sealed class BillingService(IBillingStore store, ICheckoutProvider provid
     {
         var orcamento = await store.ObterOrcamentoAsync(id, ct) ?? throw new KeyNotFoundException();
         if (orcamento.ClienteId != clienteId) throw new UnauthorizedAccessException();
+        return await AprovarEGravarAsync(orcamento, null, ct);
+    }
+    private async Task<Orcamento> AprovarEGravarAsync(Orcamento orcamento, TokenAprovacao? token, CancellationToken ct)
+    {
         orcamento.Aprovar();
+        token?.MarcarUsado(DateTimeOffset.UtcNow);
         // Outbox: o evento da Saga é gravado na mesma transação da aprovação; o despachador publica depois, sem afetar o HTTP.
         store.AdicionarMensagemSaida(MensagensSaga.OrcamentoAprovado(orcamento, DateTime.UtcNow));
         await store.SalvarAsync(ct); return orcamento;
+    }
+    /// <summary>Gera o link de aprovação de um orçamento Pendente; o token anterior deixa de valer e só o hash fica guardado.</summary>
+    public async Task<LinkAprovacao> GerarLinkAprovacaoAsync(Guid orcamentoId, CancellationToken ct)
+    {
+        var orcamento = await store.ObterOrcamentoAsync(orcamentoId, ct) ?? throw new KeyNotFoundException();
+        if (orcamento.Status != StatusOrcamento.Pendente) throw new InvalidOperationException("Orçamento não está pendente.");
+        var token = TokenAprovacao.GerarToken(); var hash = TokenAprovacao.CalcularHash(token); var agora = DateTimeOffset.UtcNow;
+        var registro = await store.ObterTokenDoOrcamentoAsync(orcamentoId, ct);
+        if (registro is null) { registro = new TokenAprovacao(orcamentoId, hash, agora); store.AdicionarToken(registro); }
+        else registro.Renovar(hash, agora);
+        await store.SalvarAsync(ct);
+        return new LinkAprovacao(token, registro.ExpiraEm);
+    }
+    /// <summary>Orçamento do link, para o resumo público; token malformado, desconhecido, expirado ou usado lança <see cref="TokenInvalidoException"/>.</summary>
+    public async Task<Orcamento> ObterOrcamentoPorTokenAsync(string? token, CancellationToken ct)
+    {
+        var (registro, orcamento) = await ResolverTokenAsync(token, ct);
+        if (registro.UsadoEm is not null) throw new TokenInvalidoException();
+        return orcamento;
+    }
+    /// <summary>Aprova pelo link: o token prova a posse, então não há checagem de dono; token já usado ou orçamento fora de Pendente lança <see cref="InvalidOperationException"/>.</summary>
+    public async Task<Orcamento> AprovarPorTokenAsync(string? token, CancellationToken ct)
+    {
+        var (registro, orcamento) = await ResolverTokenAsync(token, ct);
+        if (registro.UsadoEm is not null) throw new InvalidOperationException("Token de aprovação já utilizado.");
+        return await AprovarEGravarAsync(orcamento, registro, ct);
+    }
+    private async Task<(TokenAprovacao Token, Orcamento Orcamento)> ResolverTokenAsync(string? token, CancellationToken ct)
+    {
+        if (!TokenAprovacao.FormatoValido(token)) throw new TokenInvalidoException();
+        var registro = await store.ObterTokenPorHashAsync(TokenAprovacao.CalcularHash(token!), ct);
+        if (registro is null || registro.ExpiraEm <= DateTimeOffset.UtcNow) throw new TokenInvalidoException();
+        var orcamento = await store.ObterOrcamentoAsync(registro.OrcamentoId, ct) ?? throw new TokenInvalidoException();
+        return (registro, orcamento);
     }
     public async Task<Pagamento> AbrirCheckoutAsync(Guid pagamentoId, Guid? clienteId, CancellationToken ct)
     {

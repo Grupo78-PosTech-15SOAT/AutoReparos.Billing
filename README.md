@@ -25,6 +25,10 @@ The service applies EF Core migrations at startup. The Cobrança database and ro
 
 - `POST /api/v1/orcamentos` receives an OS budget from the `ServicoOS` identity, or an administrator/receptionist.
 - `POST /api/v1/orcamentos/{id}/aprovacao` records customer approval.
+- `GET /api/v1/orcamentos?ordemServicoId=` (Administrador, Atendente) returns the budget of an OS with its items (price snapshot), value, status and `pagamentoId`; 404 when the OS has no budget, 422 `ordem_servico_invalida` when the parameter is missing or malformed.
+- `GET /api/v1/pagamentos/{id}` (Administrador, Atendente) returns `{id, status, valor, checkoutUrl}`; 404 for an unknown id.
+- `POST /api/v1/orcamentos/{id}/link-aprovacao` (Administrador, Atendente) generates the customer approval link token for a `Pendente` budget and returns `{token, expiraEm}` once with 201 (409 `orcamento_nao_pendente` otherwise). See "Link de aprovação por token" below.
+- `GET /api/v1/orcamentos/publico?token=` and `POST /api/v1/orcamentos/publico/aprovacao` (body `{token}`) are anonymous; the token is the only credential.
 - `POST /api/v1/pagamentos/{id}/checkout` opens Checkout Pro only after approval and OS completion.
 - `POST /api/v1/pagamentos/{id}/reembolsos` records an administrator-approved partial or full refund.
 - `POST /api/v1/webhooks/mercado-pago` validates the signed notification and fetches the authoritative payment state from Mercado Pago.
@@ -67,6 +71,17 @@ O Cobrança participa da Saga orquestrada pelo OS Service apenas por mensagens S
 - **Retry e DLQ.** Falha técnica no processamento usa 5 tentativas com backoff e jitter (um escopo novo por tentativa); ao esgotar, alerta `billing.comando.esgotado` e a mensagem vai para `Sqs__ComandosDeadLetterQueueUrl`. Se nem a DLQ aceitar, alerta `billing.comando.dlq_failed` e a mensagem não é apagada da fila (volta após o visibility timeout). Sem `Sqs__ComandosQueueUrl` o consumo fica desativado.
 
 A migração `202611130001_AddMensageriaSaga` cria `mensagens_saida` e `eventos_processados` (escrita à mão, sem model snapshot, como as demais).
+
+## Link de aprovação por token
+
+O atendente gera o link em `POST /api/v1/orcamentos/{id}/link-aprovacao`; o cliente abre o resumo e aprova sem login.
+
+- **Token.** 32 bytes de `RandomNumberGenerator` em base64url (43 caracteres, 256 bits), devolvido uma única vez com 201. O banco guarda só o hash SHA-256 (hex) em `tokens_aprovacao`, com `OrcamentoId` único, `Hash` único, validade de 7 dias (`ExpiraEm`) e `UsadoEm`. Um novo pedido renova o mesmo registro (novo hash e nova validade), o que invalida o token anterior.
+- **Resumo público.** `GET /api/v1/orcamentos/publico?token=` devolve valor, status e itens, sem identificadores de cliente ou de OS. Token malformado, desconhecido, expirado ou já usado responde `404 {"codigo":"token_invalido"}`, sempre com o mesmo corpo.
+- **Aprovação pública.** `POST /api/v1/orcamentos/publico/aprovacao` com `{token}` aprova o orçamento pelo mesmo caminho da aprovação autenticada (sem checar o dono: o token prova a posse), grava `orcamento.aprovado.v1` no Outbox na mesma transação e marca o token como usado. Token inválido: 404 `token_invalido`. Token já usado, orçamento fora de `Pendente` ou aprovação concorrente perdedora (token `xmin` do orçamento): 409 `orcamento_nao_pendente`.
+- **Sem vazamento.** O token só trafega na query/corpo; o serviço nunca o registra em log nem o repete em erros, e o log de requisição do ASP.NET Core fica em `Warning` (`Microsoft.AspNetCore`) para não gravar a query string.
+
+A migração `202611160001_AddTokensAprovacao` cria `tokens_aprovacao` (escrita à mão, sem model snapshot).
 
 ## CI/CD e configuração do repositório
 
