@@ -2,7 +2,32 @@ using AutoReparos.Cobranca.Domain;
 
 namespace AutoReparos.Cobranca.Application;
 
-public sealed record CriarOrcamento(Guid OrdemServicoId, Guid ClienteId, decimal Valor);
+// Com `Itens` o valor é calculado pelos preços do catálogo da Execução (snapshot) e `Valor` deve ficar em 0; sem `Itens` vale o `Valor` informado.
+public sealed record CriarOrcamento(Guid OrdemServicoId, Guid ClienteId, decimal Valor = 0, IReadOnlyList<ItemOrcamentoSolicitado>? Itens = null);
+public sealed record ItemOrcamentoSolicitado(string Tipo, Guid ReferenciaId, int Quantidade)
+{
+    public bool TentarTipo(out TipoItemOrcamento tipo)
+    {
+        tipo = default;
+        if (string.Equals(Tipo, "servico", StringComparison.OrdinalIgnoreCase)) tipo = TipoItemOrcamento.Servico;
+        else if (string.Equals(Tipo, "insumo", StringComparison.OrdinalIgnoreCase)) tipo = TipoItemOrcamento.Insumo;
+        else return false;
+        return true;
+    }
+
+    // Itens repetidos (mesmo tipo e referência), quantidade fora da faixa e lista acima do limite são inválidos.
+    public static bool ListaValida(IReadOnlyList<ItemOrcamentoSolicitado> itens) =>
+        itens.Count <= LimitesItensOrcamento.ItensMaximos
+        && itens.All(i => i is not null && i.TentarTipo(out _) && i.ReferenciaId != Guid.Empty && i.Quantidade is >= 1 and <= LimitesItensOrcamento.QuantidadeMaxima)
+        && itens.Select(i => (i.Tipo.ToLowerInvariant(), i.ReferenciaId)).Distinct().Count() == itens.Count;
+}
+public sealed class ItemCatalogoInexistenteException(string tipo, Guid referenciaId) : Exception($"Item de catálogo inexistente: {tipo} {referenciaId}.")
+{
+    public string Tipo { get; } = tipo;
+    public Guid ReferenciaId { get; } = referenciaId;
+}
+// Preços vigentes do catálogo da Execução; devolve um item por solicitação, na mesma ordem, ou lança ItemCatalogoInexistenteException.
+public interface ICatalogoPrecos { Task<IReadOnlyList<ItemOrcamentoPreco>> ConsultarAsync(IReadOnlyList<ItemOrcamentoSolicitado> itens, CancellationToken ct); }
 public sealed record AbrirCheckout(string Url, string Referencia);
 // Contrato pagamento.resultado.v1 (envelope completo); a construção fica em MensagensSaga.ResultadoPagamento.
 public sealed record EventoPagamento(Guid EventId, string Tipo, Guid OrdemServicoId, DateTime OcorreuEm, Guid PagamentoId, string Status, string Referencia);
@@ -36,13 +61,20 @@ public interface IWebhookSignatureValidator { bool IsValid(string? signature, st
 public interface IAlertSink { Task AlertarAsync(string codigo, string detalhe, CancellationToken ct); }
 public interface IOrderReadiness { Task<bool> ServicoConcluidoAsync(Guid ordemServicoId, CancellationToken ct); }
 
-public sealed class BillingService(IBillingStore store, ICheckoutProvider provider, IResultadoPublisher publisher, IAlertSink alerts, IOrderReadiness readiness)
+public sealed class BillingService(IBillingStore store, ICheckoutProvider provider, IResultadoPublisher publisher, IAlertSink alerts, IOrderReadiness readiness, ICatalogoPrecos? catalogo = null)
 {
     public async Task<Orcamento> CriarOrcamentoAsync(CriarOrcamento request, CancellationToken ct)
     {
         var existente = await store.ObterPorOrdemAsync(request.OrdemServicoId, ct);
         if (existente is not null) return existente;
-        var orcamento = new Orcamento(request.OrdemServicoId, request.ClienteId, request.Valor, DateTimeOffset.UtcNow);
+        Orcamento orcamento;
+        if (request.Itens is { Count: > 0 } itens)
+        {
+            // Snapshot: os preços são lidos agora e gravados no orçamento; reajustes posteriores não o alteram.
+            var precos = await (catalogo ?? throw new InvalidOperationException("Catálogo de preços não configurado.")).ConsultarAsync(itens, ct);
+            orcamento = new Orcamento(request.OrdemServicoId, request.ClienteId, precos, DateTimeOffset.UtcNow);
+        }
+        else orcamento = new Orcamento(request.OrdemServicoId, request.ClienteId, request.Valor, DateTimeOffset.UtcNow);
         await store.AdicionarOrcamentoAsync(orcamento, ct); await store.SalvarAsync(ct); return orcamento;
     }
     public async Task<Orcamento> AprovarOrcamentoAsync(Guid id, Guid clienteId, CancellationToken ct)

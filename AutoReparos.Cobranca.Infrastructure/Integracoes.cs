@@ -6,6 +6,7 @@ using System.Text.Json;
 using Amazon.SQS;
 using Amazon.SQS.Model;
 using AutoReparos.Cobranca.Application;
+using AutoReparos.Cobranca.Domain;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
@@ -169,6 +170,45 @@ public static class RetryDelayPolicy
     {
         if (attempt < 1 || jitterMilliseconds is < 0 or >= 100) throw new ArgumentOutOfRangeException();
         return TimeSpan.FromMilliseconds(Math.Min(5000, 100 * (1 << Math.Min(attempt - 1, 30)) + jitterMilliseconds));
+    }
+}
+
+// Lê os preços vigentes do catálogo da Execução (GET /api/v1/servicos e /api/v1/insumos); a listagem da Execução devolve até 500 itens.
+public sealed class CatalogoExecucaoClient(HttpClient http, IConfiguration config, IAlertSink alerts, Func<int, TimeSpan>? delay = null) : ICatalogoPrecos
+{
+    public async Task<IReadOnlyList<ItemOrcamentoPreco>> ConsultarAsync(IReadOnlyList<ItemOrcamentoSolicitado> itens, CancellationToken ct)
+    {
+        var catalogos = new Dictionary<TipoItemOrcamento, Dictionary<Guid, (string Nome, decimal Preco)>>();
+        foreach (var tipo in itens.Select(i => i.TentarTipo(out var t) ? t : throw new ArgumentException("Tipo de item inválido.")).Distinct())
+            catalogos[tipo] = await LerAsync(tipo, ct);
+        var precos = new List<ItemOrcamentoPreco>();
+        foreach (var item in itens)
+        {
+            item.TentarTipo(out var tipo);
+            if (!catalogos[tipo].TryGetValue(item.ReferenciaId, out var entrada)) throw new ItemCatalogoInexistenteException(item.Tipo, item.ReferenciaId);
+            precos.Add(new ItemOrcamentoPreco(tipo, item.ReferenciaId, entrada.Nome, item.Quantidade, entrada.Preco));
+        }
+        return precos;
+    }
+
+    private Task<Dictionary<Guid, (string Nome, decimal Preco)>> LerAsync(TipoItemOrcamento tipo, CancellationToken ct)
+    {
+        var baseUrl = config["Execucao:BaseUrl"] ?? throw new InvalidOperationException("Execução não configurada.");
+        var rota = tipo == TipoItemOrcamento.Servico ? "servicos" : "insumos";
+        return DependencyHttp.SendAsync(http, alerts, "execucao", "cobranca.execucao.catalogo_failed", () =>
+        {
+            var request = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl.TrimEnd('/')}/api/v1/{rota}");
+            var serviceToken = config["Execucao:BearerToken"];
+            if (!string.IsNullOrWhiteSpace(serviceToken)) request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", serviceToken);
+            return request;
+        }, async (response, token) =>
+        {
+            using var body = MercadoPagoClient.ParseBody(await response.Content.ReadAsStringAsync(token));
+            var catalogo = new Dictionary<Guid, (string, decimal)>();
+            foreach (var elemento in body.RootElement.GetProperty("itens").EnumerateArray())
+                catalogo[elemento.GetProperty("id").GetGuid()] = (elemento.GetProperty("nome").GetString() ?? string.Empty, elemento.GetProperty("precoUnitario").GetDecimal());
+            return catalogo;
+        }, ct, delay);
     }
 }
 

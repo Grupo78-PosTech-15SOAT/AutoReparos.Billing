@@ -37,6 +37,7 @@ builder.Services.AddScoped<IBillingStore>(sp => sp.GetRequiredService<BillingDbC
 builder.Services.AddScoped<BillingService>();
 builder.Services.AddHttpClient<ICheckoutProvider, MercadoPagoClient>();
 builder.Services.AddHttpClient<IOrderReadiness, OsReadinessClient>();
+builder.Services.AddHttpClient<ICatalogoPrecos, CatalogoExecucaoClient>();
 builder.Services.AddSingleton<IWebhookSignatureValidator, MercadoPagoSignatureValidator>();
 builder.Services.AddSingleton<IAmazonSQS, AmazonSQSClient>();
 builder.Services.AddScoped<IAlertSink, LoggingAlertSink>();
@@ -87,10 +88,25 @@ app.UseAuthentication(); app.UseAuthorization();
 var orcamentos = app.MapGroup("/api/v1/orcamentos").RequireAuthorization("OperarBilling");
 orcamentos.MapPost("", async (CriarOrcamento request, BillingService service, CancellationToken ct) =>
 {
-    if (request.OrdemServicoId == Guid.Empty || request.ClienteId == Guid.Empty || request.Valor <= 0 || request.Valor > LimitesBilling.ValorMaximo || decimal.Round(request.Valor, 2) != request.Valor)
+    var comItens = request.Itens is { Count: > 0 };
+    if (request.OrdemServicoId == Guid.Empty || request.ClienteId == Guid.Empty
+        || (comItens ? request.Valor != 0 || !ItemOrcamentoSolicitado.ListaValida(request.Itens!)
+            : request.Itens is not null || request.Valor <= 0 || request.Valor > LimitesBilling.ValorMaximo || decimal.Round(request.Valor, 2) != request.Valor))
         return Results.UnprocessableEntity(new { codigo = "orcamento_invalido" });
-    var result = await service.CriarOrcamentoAsync(request, ct);
-    return Results.Created($"/api/v1/orcamentos/{result.Id}", new { result.Id, result.OrdemServicoId, result.ClienteId, result.Valor, status = result.Status.ToString(), approvalUrl = $"/api/v1/orcamentos/{result.Id}/aprovacao" });
+    Orcamento result;
+    try { result = await service.CriarOrcamentoAsync(request, ct); }
+    catch (ItemCatalogoInexistenteException ex) { return Results.UnprocessableEntity(new { codigo = "item_catalogo_inexistente", tipo = ex.Tipo, referenciaId = ex.ReferenciaId }); }
+    catch (ArgumentException) { return Results.UnprocessableEntity(new { codigo = "orcamento_invalido" }); }
+    return Results.Created($"/api/v1/orcamentos/{result.Id}", new
+    {
+        result.Id,
+        result.OrdemServicoId,
+        result.ClienteId,
+        result.Valor,
+        status = result.Status.ToString(),
+        approvalUrl = $"/api/v1/orcamentos/{result.Id}/aprovacao",
+        itens = result.Itens.Select(i => new { tipo = i.Tipo.ToString(), i.ReferenciaId, i.Descricao, i.Quantidade, i.PrecoUnitario, i.Subtotal })
+    });
 });
 app.MapPost("/api/v1/orcamentos/{id:guid}/aprovacao", async (Guid id, HttpContext context, BillingService service, CancellationToken ct) =>
 {
